@@ -1,0 +1,1459 @@
+==================================================
+Code Block #1
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 1: Загрузка ВСЕХ файлов + статистика (ROBUST)
+# ══════════════════════════════════════════════════════════
+import pandas as pd
+import numpy as np
+import glob
+import warnings
+warnings.filterwarnings('ignore')
+
+DATA_PATH = "data"
+
+# ── 1. Найти все файлы ──
+tick_files = glob.glob(f"{DATA_PATH}/ticks_*.parquet")
+bbo_files  = glob.glob(f"{DATA_PATH}/bbo_*.parquet")
+print(f"📂 Найдено ticks файлов: {len(tick_files)}")
+print(f"📂 Найдено bbo   файлов: {len(bbo_files)}")
+
+# ── 2. Безопасная загрузка ──
+def safe_read(files, name):
+    dfs, bad = [], []
+    for f in files:
+        try:
+            tmp = pd.read_parquet(f)
+            if len(tmp) == 0:
+                bad.append((f, "empty"))
+                continue
+            dfs.append(tmp)
+        except Exception as e:
+            bad.append((f, str(e)))
+    print(f"\n{name}: загружено {len(dfs)}/{len(files)} файлов", end="")
+    if bad:
+        print(f"  ⚠️ Пропущено {len(bad)}:")
+        for f, err in bad:
+            print(f"   {f} → {err}")
+    else:
+        print()
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+# ── 3. Загрузка ──
+df     = safe_read(tick_files, "ticks")
+df_bbo = safe_read(bbo_files,  "bbo")
+
+# ── 4. Сортировка по времени (КРИТИЧНО) ──
+if not df.empty:
+    df = df.sort_values('ts_ms').reset_index(drop=True)
+if not df_bbo.empty:
+    df_bbo = df_bbo.sort_values('ts_ms').reset_index(drop=True)
+
+# ── 5. Удаление дублей ──
+if not df.empty:
+    df = df.drop_duplicates(subset=['ts_ms', 'venue', 'price', 'qty'])
+if not df_bbo.empty:
+    df_bbo = df_bbo.drop_duplicates(subset=['ts_ms', 'venue'])
+
+if df.empty:
+    print("❌ Нет валидных tick-файлов")
+else:
+    # ── 6. Временной диапазон ──
+    t_min = df['ts_ms'].min()
+    t_max = df['ts_ms'].max()
+    duration_s = (t_max - t_min) / 1000
+    print(f"\n⏱️  Диапазон: {duration_s:.0f}s ({duration_s/60:.1f} мин)")
+    print(f"   Начало: {pd.Timestamp(t_min, unit='ms', tz='UTC')}")
+    print(f"   Конец:  {pd.Timestamp(t_max, unit='ms', tz='UTC')}")
+
+    # ── 7. Роли бирж ──
+    LEADERS   = ['OKX Perp', 'Bybit Perp']
+    FOLLOWERS = [v for v in df['venue'].unique() if v not in LEADERS]
+
+    # ── 8. Taker fees (bps) ──
+    FEES = {
+        'OKX Perp': 5.0, 'Bybit Perp': 5.5,
+        'Binance Perp': 4.5, 'Binance Spot': 10.0, 'Bybit Spot': 10.0,
+        'MEXC Perp': 2.0, 'Bitget Perp': 6.0, 'Gate Perp': 5.0,
+        'Hyperliquid Perp': 3.5, 'Lighter Perp': 0.0, 'edgeX Perp': 2.6,
+        'Aster Perp': 2.0,
+    }
+
+    # ── 9. Статистика по venue ──
+    print(f"\n{'Venue':<20} {'Role':<9} {'Ticks':>8} {'Rate/s':>8} {'BBO':>8} {'Fee':>6} {'Price med':>12}")
+    print("─" * 78)
+    for venue in LEADERS + sorted(FOLLOWERS):
+        sub     = df[df['venue'] == venue]
+        sub_bbo = df_bbo[df_bbo['venue'] == venue] if not df_bbo.empty else pd.DataFrame()
+        tc       = len(sub)
+        bc       = len(sub_bbo)
+        rate     = tc / duration_s if duration_s > 0 else 0
+        role     = 'leader' if venue in LEADERS else 'follower'
+        fee      = FEES.get(venue, 0)
+        price_med = f"${sub['price'].median():,.1f}" if tc > 0 else "—"
+        bbo_flag  = "✅" if bc > 0 else "—"
+        print(f"  {venue:<18} {role:<9} {tc:>8,} {rate:>8.1f} {bbo_flag:>8} {fee:>5.1f}  {price_med:>12}")
+
+    # ── 10. Проверка качества ──
+    print(f"\n🔍 Проверки качества:")
+    zero_prices = df[df['price'] <= 0]
+    print(f"   Нулевые цены: {len(zero_prices)} ({len(zero_prices)/len(df)*100:.2f}%)")
+    zero_qty = df[df['qty'] <= 0]
+    print(f"   Нулевые qty:  {len(zero_qty)} ({len(zero_qty)/len(df)*100:.2f}%)")
+    side_dist = df['side'].value_counts()
+    print(f"   Side: buy={side_dist.get('buy',0):,}, sell={side_dist.get('sell',0):,}, other={side_dist.get('unknown',0)}")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+📂 Найдено ticks файлов: 24
+📂 Найдено bbo   файлов: 24
+
+ticks: загружено 24/24 файлов
+
+bbo: загружено 24/24 файлов
+
+⏱️  Диапазон: 43198s (720.0 мин)
+   Начало: 2026-04-11 16:44:18.744000+00:00
+   Конец:  2026-04-12 04:44:17.081000+00:00
+
+Venue                Role         Ticks   Rate/s      BBO    Fee    Price med
+──────────────────────────────────────────────────────────────────────────────
+  OKX Perp           leader     721,098     16.7        ✅   5.0     $72,927.3
+  Bybit Perp         leader     585,170     13.5        ✅   5.5     $72,859.8
+  Binance Perp       follower    11,455      0.3        ✅   4.5     $73,062.3
+  Binance Spot       follower     5,956      0.1        ✅  10.0     $73,106.7
+  Bitget Perp        follower   583,178     13.5        ✅   6.0     $72,865.9
+  Bybit Spot         follower   294,403      6.8        ✅  10.0     $73,000.0
+  Gate Perp          follower   338,400      7.8        —   5.0     $72,924.4
+  Hyperliquid Perp   follower     4,256      0.1        —   3.5     $73,097.0
+  Lighter Perp       follower   273,543      6.3        ✅   0.0     $73,033.5
+  MEXC Perp          follower   397,718      9.2        —   2.0     $73,068.0
+  edgeX Perp         follower    28,762      0.7        ✅   2.6     $73,039.2
+
+🔍 Проверки качества:
+   Нулевые цены: 0 (0.00%)
+   Нулевые qty:  0 (0.00%)
+   Side: buy=1,642,164, sell=1,601,775, other=0
+
+STREAM OUTPUT (stdout):
+📂 Найдено ticks файлов: 24
+📂 Найдено bbo   файлов: 24
+
+ticks: загружено 24/24 файлов
+
+bbo: загружено 24/24 файлов
+
+⏱️  Диапазон: 43198s (720.0 мин)
+   Начало: 2026-04-11 16:44:18.744000+00:00
+   Конец:  2026-04-12 04:44:17.081000+00:00
+
+Venue                Role         Ticks   Rate/s      BBO    Fee    Price med
+──────────────────────────────────────────────────────────────────────────────
+  OKX Perp           leader     721,098     16.7        ✅   5.0     $72,927.3
+  Bybit Perp         leader     585,170     13.5        ✅   5.5     $72,859.8
+  Binance Perp       follower    11,455      0.3        ✅   4.5     $73,062.3
+  Binance Spot       follower     5,956      0.1        ✅  10.0     $73,106.7
+  Bitget Perp        follower   583,178     13.5        ✅   6.0     $72,865.9
+  Bybit Spot         follower   294,403      6.8        ✅  10.0     $73,000.0
+  Gate Perp          follower   338,400      7.8        —   5.0     $72,924.4
+  Hyperliquid Perp   follower     4,256      0.1        —   3.5     $73,097.0
+  Lighter Perp       follower   273,543      6.3        ✅   0.0     $73,033.5
+  MEXC Perp          follower   397,718      9.2        —   2.0     $73,068.0
+  edgeX Perp         follower    28,762      0.7        ✅   2.6     $73,039.2
+
+🔍 Проверки качества:
+   Нулевые цены: 0 (0.00%)
+   Нулевые qty:  0 (0.00%)
+   Side: buy=1,642,164, sell=1,601,775, other=0
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #2
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 2: Бинирование 50ms VWAP, ffill, log-returns
+# ══════════════════════════════════════════════════════════
+
+BIN_SIZE_MS = 50
+
+# ── Временная сетка ──
+t_start = df['ts_ms'].min()
+t_end   = df['ts_ms'].max()
+n_bins  = int((t_end - t_start) / BIN_SIZE_MS) + 1
+
+print(f"⏱️  Сетка: {n_bins:,} бинов по {BIN_SIZE_MS}ms = {n_bins * BIN_SIZE_MS / 1000:.0f}s")
+
+# ── Assign bin index ──
+df = df.copy()
+df['bin_idx'] = ((df['ts_ms'] - t_start) // BIN_SIZE_MS).astype(int)
+df['pv']      = df['price'] * df['qty']
+
+# ── VWAP per bin per venue ──
+grouped = df.groupby(['venue', 'bin_idx']).agg(
+    vwap_num=('pv',    'sum'),
+    vwap_den=('qty',   'sum'),
+    tick_count=('price','count'),
+).reset_index()
+grouped['vwap'] = grouped['vwap_num'] / grouped['vwap_den']
+
+# ── Pivot: venue × bin_idx → vwap matrix ──
+all_venues = LEADERS + sorted(FOLLOWERS)
+vwap_dict  = {}
+
+for venue in all_venues:
+    sub    = grouped[grouped['venue'] == venue][['bin_idx', 'vwap']].set_index('bin_idx')['vwap']
+    series = pd.Series(index=range(n_bins), dtype=float)
+    series.loc[sub.index] = sub.values
+    series = series.ffill()   # без лимита — всегда последняя известная цена
+    vwap_dict[venue] = series
+
+vwap_df = pd.DataFrame(vwap_dict)
+vwap_df.index.name = 'bin_idx'
+vwap_df['ts_ms'] = t_start + vwap_df.index * BIN_SIZE_MS
+
+# ── Покрытие (% бинов с данными до ffill) ──
+raw_coverage = {}
+for venue in all_venues:
+    sub = grouped[grouped['venue'] == venue]
+    raw_coverage[venue] = len(sub) / n_bins * 100
+
+# ── Log-returns для лидеров ──
+for leader in LEADERS:
+    vwap_df[f'{leader}_logret'] = np.log(vwap_df[leader] / vwap_df[leader].shift(1))
+
+# ── Статистика ──
+print(f"\n{'Venue':<20} {'Покрытие':>10} {'NaN после ffill':>16} {'VWAP med':>12}")
+print("─" * 62)
+for venue in all_venues:
+    cov     = raw_coverage[venue]
+    nan_pct = vwap_df[venue].isna().sum() / n_bins * 100
+    med     = vwap_df[venue].median()
+    med_str = f"${med:,.1f}" if not np.isnan(med) else "—"
+    print(f"  {venue:<18} {cov:>9.2f}% {nan_pct:>15.1f}% {med_str:>12}")
+
+# ── σ статистика для лидеров ──
+print(f"\n📈 Волатильность лидеров (log-returns):")
+for leader in LEADERS:
+    col = f'{leader}_logret'
+    lr  = vwap_df[col].dropna()
+    sigma_bin    = lr.std()
+    sigma_10     = sigma_bin * np.sqrt(10)
+    threshold    = 1.5 * sigma_10
+    print(f"  {leader}:")
+    print(f"    σ_bin (50ms):     {sigma_bin:.6f} ({sigma_bin*10000:.2f} bps)")
+    print(f"    σ_window (500ms): {sigma_10:.6f} ({sigma_10*10000:.2f} bps)")
+    print(f"    Порог (1.5σ):     {threshold:.6f} ({threshold*10000:.2f} bps)")
+
+print(f"\n✅ vwap_df: {vwap_df.shape[0]:,} строк × {vwap_df.shape[1]} столбцов")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+⏱️  Сетка: 863,967 бинов по 50ms = 43198s
+
+Venue                  Покрытие  NaN после ffill     VWAP med
+──────────────────────────────────────────────────────────────
+  OKX Perp               19.35%             0.0%    $73,067.6
+  Bybit Perp              9.92%             0.0%    $73,059.8
+  Binance Perp            0.13%             0.0%    $73,115.9
+  Binance Spot            0.08%             0.0%    $73,157.3
+  Bitget Perp            10.69%             0.0%    $73,061.8
+  Bybit Spot              4.79%             0.0%    $73,098.5
+  Gate Perp              10.72%             0.0%    $73,059.7
+  Hyperliquid Perp        0.07%             0.0%    $73,145.0
+  Lighter Perp           12.07%             0.0%    $73,068.6
+  MEXC Perp              15.39%             0.0%    $73,058.9
+  edgeX Perp              3.15%             0.0%    $73,057.9
+
+📈 Волатильность лидеров (log-returns):
+  OKX Perp:
+    σ_bin (50ms):     0.000012 (0.12 bps)
+    σ_window (500ms): 0.000038 (0.38 bps)
+    Порог (1.5σ):     0.000057 (0.57 bps)
+  Bybit Perp:
+    σ_bin (50ms):     0.000012 (0.12 bps)
+    σ_window (500ms): 0.000037 (0.37 bps)
+    Порог (1.5σ):     0.000055 (0.55 bps)
+
+✅ vwap_df: 863,967 строк × 14 столбцов
+
+STREAM OUTPUT (stdout):
+⏱️  Сетка: 863,967 бинов по 50ms = 43198s
+
+Venue                  Покрытие  NaN после ffill     VWAP med
+──────────────────────────────────────────────────────────────
+  OKX Perp               19.35%             0.0%    $73,067.6
+  Bybit Perp              9.92%             0.0%    $73,059.8
+  Binance Perp            0.13%             0.0%    $73,115.9
+  Binance Spot            0.08%             0.0%    $73,157.3
+  Bitget Perp            10.69%             0.0%    $73,061.8
+  Bybit Spot              4.79%             0.0%    $73,098.5
+  Gate Perp              10.72%             0.0%    $73,059.7
+  Hyperliquid Perp        0.07%             0.0%    $73,145.0
+  Lighter Perp           12.07%             0.0%    $73,068.6
+  MEXC Perp              15.39%             0.0%    $73,058.9
+  edgeX Perp              3.15%             0.0%    $73,057.9
+
+📈 Волатильность лидеров (log-returns):
+  OKX Perp:
+    σ_bin (50ms):     0.000012 (0.12 bps)
+    σ_window (500ms): 0.000038 (0.38 bps)
+    Порог (1.5σ):     0.000057 (0.57 bps)
+  Bybit Perp:
+    σ_bin (50ms):     0.000012 (0.12 bps)
+    σ_window (500ms): 0.000037 (0.37 bps)
+    Порог (1.5σ):     0.000055 (0.55 bps)
+
+✅ vwap_df: 863,967 строк × 14 столбцов
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #3
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 3: EMA baseline, dev_df, детекция событий
+# FIX: Signal C берёт lagging из ANCHOR (первого лидера),
+#      а не intersection. Confirmer только подтверждает силу.
+# ══════════════════════════════════════════════════════════
+
+EMA_SPAN_BINS       = 200   # 10s
+DEVIATION_THRESHOLD_SIGMA = 2.0
+FOLLOWER_MAX_DEVIATION    = 0.5   # σ — follower не должен двигаться в сторону сигнала
+CLUSTER_GAP_BINS    = 60    # 3s
+DETECTION_WINDOW_BINS =10
+
+# ── 1. EMA baseline для каждого venue ──
+ema_dict = {}
+for venue in LEADERS + sorted(FOLLOWERS):
+    s = vwap_df[venue].copy()
+    ema_dict[venue] = s.ewm(span=EMA_SPAN_BINS, adjust=False, min_periods=EMA_SPAN_BINS).mean()
+
+ema_df = pd.DataFrame(ema_dict)
+print(f"✅ ema_df: {ema_df.shape}")
+
+# ── 2. Deviation от EMA в σ-единицах ──
+sigma_dict = {}
+for venue in LEADERS + sorted(FOLLOWERS):
+    lr = np.log(vwap_df[venue] / vwap_df[venue].shift(1)).dropna()
+    sigma_dict[venue] = lr.std() * np.sqrt(EMA_SPAN_BINS)
+
+dev_dict = {}
+for venue in LEADERS + sorted(FOLLOWERS):
+    sig = sigma_dict[venue]
+    if sig > 0:
+        dev_dict[venue] = (vwap_df[venue] - ema_df[venue]) / (sig * vwap_df[venue])
+    else:
+        dev_dict[venue] = pd.Series(0.0, index=vwap_df.index)
+
+dev_df = pd.DataFrame(dev_dict)
+print(f"✅ dev_df: {dev_df.shape}")
+
+# ── Статистика dev ──
+print(f"\n{'Venue':<20} {'σ_ema':>10} {'dev_std':>10} {'dev_max':>10}")
+print("─" * 52)
+for venue in LEADERS + sorted(FOLLOWERS):
+    d = dev_df[venue].dropna()
+    print(f"  {venue:<18} {sigma_dict[venue]*10000:>8.2f}bps {d.std():>10.3f} {d.abs().max():>10.3f}")
+
+# ── 3. Детекция событий: ПЕРВОЕ пересечение порога ──
+def detect_ema_events_v3(leader, followers_list, dev_df, threshold, fol_max_dev):
+    """
+    Ловим ПЕРВЫЙ бин когда |leader_dev| пересекает threshold (переход: не был → стал).
+    Follower считается lagging если его движение В СТОРОНУ сигнала < fol_max_dev * σ.
+    """
+    events = []
+    leader_dev = dev_df[leader].values
+    n = len(leader_dev)
+    was_above = False
+
+    for t in range(EMA_SPAN_BINS * 2, n):
+        if np.isnan(leader_dev[t]):
+            was_above = False
+            continue
+
+        is_above = abs(leader_dev[t]) >= threshold
+
+        if is_above and not was_above:
+            direction = 1 if leader_dev[t] > 0 else -1
+            magnitude = abs(leader_dev[t])
+            lagging_followers = []
+
+            for fol in followers_list:
+                fol_dev_vals = dev_df[fol].values
+                if t >= len(fol_dev_vals) or np.isnan(fol_dev_vals[t]):
+                    continue
+                
+                window_start = max(0, t - DETECTION_WINDOW_BINS)
+                fol_window = fol_dev_vals[window_start:t+1]
+                fol_window = fol_window[~np.isnan(fol_window)]
+                
+                if len(fol_window) == 0:
+                    continue
+                
+                fol_max_in_dir = max(0.0, direction * fol_window.max() if direction > 0
+                                     else direction * fol_window.min())
+                
+                if fol_max_in_dir < fol_max_dev:
+                    lagging_followers.append(fol)
+
+            if lagging_followers:
+                events.append({
+                    'bin_idx':          t,
+                    'ts_ms':            int(t_start + t * BIN_SIZE_MS),
+                    'direction':        direction,
+                    'magnitude_sigma':  magnitude,
+                    'leader':           leader,
+                    'leader_dev':       float(leader_dev[t]),
+                    'lagging_followers': lagging_followers,
+                    'n_lagging':        len(lagging_followers),
+                })
+
+        was_above = is_above
+
+    return events
+
+# ── 4. Кластеризация: берём ПЕРВОЕ событие в кластере ──
+def cluster_events_first(events, gap_bins):
+    if not events:
+        return []
+    sorted_ev = sorted(events, key=lambda e: e['bin_idx'])
+    clusters, current = [], [sorted_ev[0]]
+    for ev in sorted_ev[1:]:
+        if ev['bin_idx'] - current[-1]['bin_idx'] <= gap_bins:
+            current.append(ev)
+        else:
+            clusters.append(current)
+            current = [ev]
+    clusters.append(current)
+    return [cl[0] for cl in clusters]
+
+# ── 5. Запускаем детекцию ──
+all_raw_events = {}
+for leader in LEADERS:
+    raw = detect_ema_events_v3(leader, sorted(FOLLOWERS), dev_df,
+                               DEVIATION_THRESHOLD_SIGMA, FOLLOWER_MAX_DEVIATION)
+    all_raw_events[leader] = raw
+    print(f"\n📍 {leader}: {len(raw)} crossings (±{DEVIATION_THRESHOLD_SIGMA}σ)")
+
+clustered = {}
+for leader in LEADERS:
+    cl = cluster_events_first(all_raw_events[leader], CLUSTER_GAP_BINS)
+    clustered[leader] = cl
+    print(f"   → После кластеризации: {len(cl)} событий")
+
+# ── 6. Сигналы A / B / C ──
+# FIX: Signal C теперь берёт lagging_followers из ANCHOR (первого лидера),
+#      а не intersection двух. Confirmer подтверждает силу движения,
+#      но не фильтрует followers — к моменту confirmer они уже реагируют.
+
+signal_a = [dict(e, signal='A') for e in clustered.get('OKX Perp', [])]
+signal_b = [dict(e, signal='B') for e in clustered.get('Bybit Perp', [])]
+
+CONFIRM_WINDOW_BINS = 10
+signal_c = []
+used_okx  = set()
+used_bybit = set()
+
+for i, ev_o in enumerate(clustered.get('OKX Perp', [])):
+    for j, ev_b in enumerate(clustered.get('Bybit Perp', [])):
+        if j in used_bybit:
+            continue
+        if (abs(ev_o['bin_idx'] - ev_b['bin_idx']) <= CONFIRM_WINDOW_BINS
+                and ev_o['direction'] == ev_b['direction']):
+
+            # anchor = более ранний из двух
+            anchor    = ev_o if ev_o['bin_idx'] <= ev_b['bin_idx'] else ev_b
+            confirmer = ev_b if ev_o['bin_idx'] <= ev_b['bin_idx'] else ev_o
+
+            # FIX: берём lagging из ANCHOR — это момент первого сигнала,
+            # когда followers ещё не среагировали
+            anchor_lagging = anchor['lagging_followers']
+
+            if anchor_lagging:
+                signal_c.append(dict(
+                    anchor,
+                    signal='C',
+                    magnitude_sigma=max(anchor['magnitude_sigma'],
+                                        confirmer['magnitude_sigma']),
+                    leader='confirmed',
+                    confirmer_leader=confirmer['leader'],
+                    confirmer_bin=confirmer['bin_idx'],
+                    confirmer_lag_ms=(confirmer['bin_idx'] - anchor['bin_idx']) * BIN_SIZE_MS,
+                    lagging_followers=anchor_lagging,
+                    n_lagging=len(anchor_lagging),
+                ))
+            used_okx.add(i)
+            used_bybit.add(j)
+            break
+
+# Bin_idx событий вошедших в Signal C — исключаем их из A и B
+c_leader_bins = set()
+for ev_c in signal_c:
+    c_leader_bins.add(ev_c['bin_idx'])
+    t0, d = ev_c['bin_idx'], ev_c['direction']
+    for ev_o in clustered.get('OKX Perp', []):
+        if abs(ev_o['bin_idx'] - t0) <= CONFIRM_WINDOW_BINS and ev_o['direction'] == d:
+            c_leader_bins.add(ev_o['bin_idx'])
+    for ev_b in clustered.get('Bybit Perp', []):
+        if abs(ev_b['bin_idx'] - t0) <= CONFIRM_WINDOW_BINS and ev_b['direction'] == d:
+            c_leader_bins.add(ev_b['bin_idx'])
+
+signal_a_clean = [e for e in signal_a if e['bin_idx'] not in c_leader_bins]
+signal_b_clean = [e for e in signal_b if e['bin_idx'] not in c_leader_bins]
+
+all_events = signal_a_clean + signal_b_clean + signal_c
+events_df = pd.DataFrame(all_events)
+
+print(f"\n{'═'*60}")
+print(f"📊 Итого (C заменяет пересекающиеся A/B):")
+print(f"   Signal A (raw): {len(signal_a)}  → clean: {len(signal_a_clean)}")
+print(f"   Signal B (raw): {len(signal_b)}  → clean: {len(signal_b_clean)}")
+print(f"   Signal C:       {len(signal_c)}")
+print(f"   ВСЕГО: {len(all_events)}")
+
+if len(events_df) > 0:
+    print(f"\n📈 Magnitude: mean={events_df['magnitude_sigma'].mean():.2f}σ, "
+          f"median={events_df['magnitude_sigma'].median():.2f}σ")
+    print(f"👥 Lagging followers: mean={events_df['n_lagging'].mean():.1f}, "
+          f"median={events_df['n_lagging'].median():.0f}")
+
+# Показываем confirmer lag для Signal C
+if signal_c:
+    print(f"\n📐 Signal C confirmer lag:")
+    for ev in signal_c:
+        cl = ev.get('confirmer_lag_ms', '?')
+        print(f"   bin {ev['bin_idx']}: anchor={ev['leader']}, "
+              f"confirmer={ev.get('confirmer_leader','?')}, lag={cl}ms, "
+              f"mag={ev['magnitude_sigma']:.2f}σ, "
+              f"n_lagging={ev['n_lagging']}")
+
+# Финальная проверка дублей
+from collections import Counter
+bin_counts = Counter(ev['bin_idx'] for ev in all_events)
+dups = {b: c for b, c in bin_counts.items() if c > 1}
+if dups:
+    print(f"\n⚠️  Остались дубли: {dups}")
+else:
+    print(f"\n✅ Дублей нет")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ ema_df: (863967, 11)
+✅ dev_df: (863967, 11)
+
+Venue                     σ_ema    dev_std    dev_max
+────────────────────────────────────────────────────
+  OKX Perp               1.69bps      0.676     18.316
+  Bybit Perp             1.64bps      0.698     19.269
+  Binance Perp           0.13bps      0.825     44.262
+  Binance Spot           0.12bps      0.890     43.167
+  Bitget Perp            1.59bps      0.714     16.979
+  Bybit Spot             1.59bps      0.707     29.608
+  Gate Perp              1.51bps      0.707     17.321
+  Hyperliquid Perp       0.18bps      0.649     33.417
+  Lighter Perp           2.58bps      0.460     18.460
+  MEXC Perp              1.60bps      0.698     15.996
+  edgeX Perp             2.03bps      0.552     11.050
+
+📍 OKX Perp: 585 crossings (±2.0σ)
+
+📍 Bybit Perp: 584 crossings (±2.0σ)
+   → После кластеризации: 364 событий
+   → После кластеризации: 384 событий
+
+════════════════════════════════════════════════════════════
+📊 Итого (C заменяет пересекающиеся A/B):
+   Signal A (raw): 364  → clean: 135
+   Signal B (raw): 384  → clean: 155
+   Signal C:       229
+   ВСЕГО: 519
+
+📈 Magnitude: mean=2.51σ, median=2.27σ
+👥 Lagging followers: mean=4.2, median=3
+
+📐 Signal C confirmer lag:
+   bin 55191: anchor=confirmed, confirmer=OKX Perp, lag=450ms, mag=2.75σ, n_lagging=6
+   bin 129525: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.51σ, n_lagging=6
+   bin 140353: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.62σ, n_lagging=3
+   bin 142939: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.51σ, n_lagging=3
+   bin 145601: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.60σ, n_lagging=5
+   bin 162839: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=3
+   bin 163982: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.04σ, n_lagging=5
+   bin 164156: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.46σ, n_lagging=4
+   bin 165261: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.11σ, n_lagging=7
+   bin 169596: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.64σ, n_lagging=4
+   bin 181079: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.40σ, n_lagging=3
+   bin 185898: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 201303: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.44σ, n_lagging=3
+   bin 202160: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.32σ, n_lagging=3
+   bin 202339: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.46σ, n_lagging=5
+   bin 202514: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.59σ, n_lagging=3
+   bin 202685: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.29σ, n_lagging=3
+   bin 252870: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.74σ, n_lagging=4
+   bin 266221: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.33σ, n_lagging=3
+   bin 271871: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.88σ, n_lagging=6
+   bin 272690: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.37σ, n_lagging=6
+   bin 274229: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=3.65σ, n_lagging=5
+   bin 275955: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.49σ, n_lagging=3
+   bin 277630: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.41σ, n_lagging=3
+   bin 279275: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.07σ, n_lagging=3
+   bin 292450: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.48σ, n_lagging=6
+   bin 309261: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=3
+   bin 334037: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.78σ, n_lagging=5
+   bin 335203: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=6
+   bin 336152: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.81σ, n_lagging=6
+   bin 340167: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.37σ, n_lagging=6
+   bin 366687: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.23σ, n_lagging=6
+   bin 367108: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.56σ, n_lagging=6
+   bin 367338: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.66σ, n_lagging=3
+   bin 370571: anchor=confirmed, confirmer=Bybit Perp, lag=250ms, mag=2.47σ, n_lagging=3
+   bin 378243: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.51σ, n_lagging=5
+   bin 378844: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.19σ, n_lagging=3
+   bin 398334: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=3.02σ, n_lagging=6
+   bin 412029: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.08σ, n_lagging=6
+   bin 414725: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.13σ, n_lagging=7
+   bin 416633: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.76σ, n_lagging=3
+   bin 416861: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.05σ, n_lagging=3
+   bin 420866: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.95σ, n_lagging=4
+   bin 423308: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.17σ, n_lagging=6
+   bin 423720: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.56σ, n_lagging=5
+   bin 427945: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.65σ, n_lagging=6
+   bin 438769: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.38σ, n_lagging=6
+   bin 439253: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.49σ, n_lagging=6
+   bin 445069: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.50σ, n_lagging=6
+   bin 456706: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.75σ, n_lagging=6
+   bin 456839: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.00σ, n_lagging=3
+   bin 459515: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.45σ, n_lagging=6
+   bin 460049: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.10σ, n_lagging=3
+   bin 460447: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.18σ, n_lagging=4
+   bin 460701: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.57σ, n_lagging=6
+   bin 462858: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.13σ, n_lagging=3
+   bin 510716: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.69σ, n_lagging=3
+   bin 519355: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.31σ, n_lagging=7
+   bin 526345: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.05σ, n_lagging=3
+   bin 528370: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.56σ, n_lagging=4
+   bin 528585: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.62σ, n_lagging=3
+   bin 531921: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.12σ, n_lagging=6
+   bin 535906: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.09σ, n_lagging=4
+   bin 537129: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.21σ, n_lagging=9
+   bin 543422: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.62σ, n_lagging=5
+   bin 547366: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.02σ, n_lagging=3
+   bin 599689: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.24σ, n_lagging=5
+   bin 602515: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.56σ, n_lagging=5
+   bin 611116: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.66σ, n_lagging=6
+   bin 634643: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.49σ, n_lagging=3
+   bin 634723: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.83σ, n_lagging=3
+   bin 634964: anchor=confirmed, confirmer=Bybit Perp, lag=150ms, mag=2.05σ, n_lagging=7
+   bin 635116: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.38σ, n_lagging=3
+   bin 635460: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.31σ, n_lagging=3
+   bin 635752: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.59σ, n_lagging=3
+   bin 636051: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=6
+   bin 636634: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.18σ, n_lagging=3
+   bin 636821: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.36σ, n_lagging=8
+   bin 636976: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.47σ, n_lagging=3
+   bin 637281: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.70σ, n_lagging=6
+   bin 637407: anchor=confirmed, confirmer=Bybit Perp, lag=200ms, mag=2.24σ, n_lagging=3
+   bin 637510: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.42σ, n_lagging=6
+   bin 637792: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.46σ, n_lagging=5
+   bin 638065: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.79σ, n_lagging=5
+   bin 638225: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.54σ, n_lagging=5
+   bin 638597: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.67σ, n_lagging=3
+   bin 638747: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.25σ, n_lagging=3
+   bin 638826: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.63σ, n_lagging=3
+   bin 639132: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.19σ, n_lagging=3
+   bin 639244: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.27σ, n_lagging=3
+   bin 639447: anchor=confirmed, confirmer=OKX Perp, lag=500ms, mag=2.08σ, n_lagging=3
+   bin 640250: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=6
+   bin 640374: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.89σ, n_lagging=5
+   bin 640491: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.72σ, n_lagging=3
+   bin 640765: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.07σ, n_lagging=3
+   bin 640891: anchor=confirmed, confirmer=Bybit Perp, lag=150ms, mag=2.50σ, n_lagging=3
+   bin 641125: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.33σ, n_lagging=3
+   bin 641549: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.16σ, n_lagging=3
+   bin 641846: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.14σ, n_lagging=3
+   bin 641939: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.37σ, n_lagging=6
+   bin 642837: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.50σ, n_lagging=3
+   bin 643320: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=3
+   bin 643469: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.78σ, n_lagging=3
+   bin 643742: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.46σ, n_lagging=3
+   bin 644525: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.30σ, n_lagging=3
+   bin 644621: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.22σ, n_lagging=3
+   bin 645663: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.18σ, n_lagging=3
+   bin 645787: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.29σ, n_lagging=3
+   bin 645929: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.50σ, n_lagging=3
+   bin 646304: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.30σ, n_lagging=3
+   bin 646516: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.75σ, n_lagging=3
+   bin 646679: anchor=confirmed, confirmer=OKX Perp, lag=500ms, mag=2.37σ, n_lagging=3
+   bin 647112: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=4.08σ, n_lagging=3
+   bin 647326: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.72σ, n_lagging=3
+   bin 648708: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.75σ, n_lagging=3
+   bin 648786: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.30σ, n_lagging=3
+   bin 649160: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.34σ, n_lagging=3
+   bin 649687: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.13σ, n_lagging=5
+   bin 649771: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.08σ, n_lagging=4
+   bin 650023: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=6.24σ, n_lagging=7
+   bin 650137: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.79σ, n_lagging=3
+   bin 650322: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=4.14σ, n_lagging=3
+   bin 650390: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.64σ, n_lagging=3
+   bin 650894: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.91σ, n_lagging=7
+   bin 651364: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.97σ, n_lagging=3
+   bin 652578: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.14σ, n_lagging=5
+   bin 652661: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.13σ, n_lagging=3
+   bin 652730: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.39σ, n_lagging=3
+   bin 652919: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=3
+   bin 653119: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.31σ, n_lagging=4
+   bin 653221: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.71σ, n_lagging=3
+   bin 653358: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.02σ, n_lagging=3
+   bin 653675: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.25σ, n_lagging=3
+   bin 654055: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.27σ, n_lagging=3
+   bin 654166: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.17σ, n_lagging=5
+   bin 654686: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.65σ, n_lagging=5
+   bin 654837: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.43σ, n_lagging=5
+   bin 655410: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.21σ, n_lagging=6
+   bin 655619: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.34σ, n_lagging=3
+   bin 656171: anchor=confirmed, confirmer=Bybit Perp, lag=500ms, mag=2.33σ, n_lagging=3
+   bin 656458: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.07σ, n_lagging=4
+   bin 656596: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.05σ, n_lagging=3
+   bin 656747: anchor=confirmed, confirmer=Bybit Perp, lag=500ms, mag=2.25σ, n_lagging=3
+   bin 657144: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.88σ, n_lagging=3
+   bin 657624: anchor=confirmed, confirmer=OKX Perp, lag=450ms, mag=2.31σ, n_lagging=3
+   bin 658119: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.29σ, n_lagging=3
+   bin 658802: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=5.14σ, n_lagging=7
+   bin 659169: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.52σ, n_lagging=4
+   bin 659292: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.06σ, n_lagging=4
+   bin 659517: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.08σ, n_lagging=3
+   bin 659613: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.44σ, n_lagging=3
+   bin 659825: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.60σ, n_lagging=5
+   bin 661022: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.64σ, n_lagging=3
+   bin 662659: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.52σ, n_lagging=4
+   bin 662724: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.68σ, n_lagging=3
+   bin 662796: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.31σ, n_lagging=4
+   bin 663153: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=3
+   bin 663224: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.68σ, n_lagging=3
+   bin 663312: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.36σ, n_lagging=3
+   bin 663658: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.74σ, n_lagging=6
+   bin 663780: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.05σ, n_lagging=6
+   bin 663930: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.23σ, n_lagging=5
+   bin 664315: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.19σ, n_lagging=3
+   bin 664752: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 666833: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.09σ, n_lagging=6
+   bin 667119: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.17σ, n_lagging=6
+   bin 667235: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.35σ, n_lagging=3
+   bin 667342: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.08σ, n_lagging=3
+   bin 667890: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.39σ, n_lagging=4
+   bin 668109: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.05σ, n_lagging=3
+   bin 668762: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.21σ, n_lagging=3
+   bin 669054: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.55σ, n_lagging=4
+   bin 669293: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.31σ, n_lagging=3
+   bin 669495: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.24σ, n_lagging=3
+   bin 669620: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.39σ, n_lagging=5
+   bin 669898: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.27σ, n_lagging=3
+   bin 671359: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.41σ, n_lagging=3
+   bin 671921: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.36σ, n_lagging=4
+   bin 672258: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.14σ, n_lagging=5
+   bin 672845: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.18σ, n_lagging=3
+   bin 672969: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.24σ, n_lagging=3
+   bin 673392: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.59σ, n_lagging=3
+   bin 673967: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.24σ, n_lagging=3
+   bin 674570: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.48σ, n_lagging=3
+   bin 675904: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.63σ, n_lagging=3
+   bin 675981: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.09σ, n_lagging=3
+   bin 677293: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.23σ, n_lagging=3
+   bin 677459: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.35σ, n_lagging=3
+   bin 679007: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=4.23σ, n_lagging=6
+   bin 679192: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.68σ, n_lagging=3
+   bin 679704: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.03σ, n_lagging=3
+   bin 679880: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.25σ, n_lagging=3
+   bin 681325: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.41σ, n_lagging=4
+   bin 682183: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.31σ, n_lagging=7
+   bin 683037: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.36σ, n_lagging=3
+   bin 686229: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.38σ, n_lagging=7
+   bin 687315: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.25σ, n_lagging=4
+   bin 687719: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.05σ, n_lagging=3
+   bin 692871: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=4.40σ, n_lagging=7
+   bin 697356: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.69σ, n_lagging=5
+   bin 697509: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.33σ, n_lagging=3
+   bin 698155: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 698251: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.71σ, n_lagging=3
+   bin 704771: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.63σ, n_lagging=3
+   bin 706673: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=3
+   bin 729486: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.07σ, n_lagging=6
+   bin 732732: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.98σ, n_lagging=6
+   bin 737483: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.06σ, n_lagging=3
+   bin 740156: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.38σ, n_lagging=4
+   bin 748717: anchor=confirmed, confirmer=Bybit Perp, lag=250ms, mag=2.24σ, n_lagging=3
+   bin 752708: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.62σ, n_lagging=5
+   bin 756691: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.61σ, n_lagging=6
+   bin 766644: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.79σ, n_lagging=5
+   bin 766954: anchor=confirmed, confirmer=OKX Perp, lag=250ms, mag=2.61σ, n_lagging=4
+   bin 772887: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.61σ, n_lagging=6
+   bin 780008: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.25σ, n_lagging=3
+   bin 781818: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.30σ, n_lagging=6
+   bin 784408: anchor=confirmed, confirmer=Bybit Perp, lag=200ms, mag=2.16σ, n_lagging=6
+   bin 785994: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.15σ, n_lagging=7
+   bin 786657: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=3
+   bin 788439: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.40σ, n_lagging=5
+   bin 798492: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.90σ, n_lagging=6
+   bin 821595: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.08σ, n_lagging=5
+   bin 822340: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.10σ, n_lagging=3
+   bin 822462: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.93σ, n_lagging=3
+   bin 828717: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.32σ, n_lagging=5
+   bin 828922: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.70σ, n_lagging=7
+   bin 833680: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.35σ, n_lagging=6
+   bin 846728: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.36σ, n_lagging=6
+
+✅ Дублей нет
+
+STREAM OUTPUT (stdout):
+✅ ema_df: (863967, 11)
+✅ dev_df: (863967, 11)
+
+Venue                     σ_ema    dev_std    dev_max
+────────────────────────────────────────────────────
+  OKX Perp               1.69bps      0.676     18.316
+  Bybit Perp             1.64bps      0.698     19.269
+  Binance Perp           0.13bps      0.825     44.262
+  Binance Spot           0.12bps      0.890     43.167
+  Bitget Perp            1.59bps      0.714     16.979
+  Bybit Spot             1.59bps      0.707     29.608
+  Gate Perp              1.51bps      0.707     17.321
+  Hyperliquid Perp       0.18bps      0.649     33.417
+  Lighter Perp           2.58bps      0.460     18.460
+  MEXC Perp              1.60bps      0.698     15.996
+  edgeX Perp             2.03bps      0.552     11.050
+
+📍 OKX Perp: 585 crossings (±2.0σ)
+
+📍 Bybit Perp: 584 crossings (±2.0σ)
+   → После кластеризации: 364 событий
+   → После кластеризации: 384 событий
+
+════════════════════════════════════════════════════════════
+📊 Итого (C заменяет пересекающиеся A/B):
+   Signal A (raw): 364  → clean: 135
+   Signal B (raw): 384  → clean: 155
+   Signal C:       229
+   ВСЕГО: 519
+
+📈 Magnitude: mean=2.51σ, median=2.27σ
+👥 Lagging followers: mean=4.2, median=3
+
+📐 Signal C confirmer lag:
+   bin 55191: anchor=confirmed, confirmer=OKX Perp, lag=450ms, mag=2.75σ, n_lagging=6
+   bin 129525: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.51σ, n_lagging=6
+   bin 140353: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.62σ, n_lagging=3
+   bin 142939: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.51σ, n_lagging=3
+   bin 145601: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.60σ, n_lagging=5
+   bin 162839: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=3
+   bin 163982: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.04σ, n_lagging=5
+   bin 164156: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.46σ, n_lagging=4
+   bin 165261: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.11σ, n_lagging=7
+   bin 169596: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.64σ, n_lagging=4
+   bin 181079: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.40σ, n_lagging=3
+   bin 185898: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 201303: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.44σ, n_lagging=3
+   bin 202160: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.32σ, n_lagging=3
+   bin 202339: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.46σ, n_lagging=5
+   bin 202514: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.59σ, n_lagging=3
+   bin 202685: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.29σ, n_lagging=3
+   bin 252870: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.74σ, n_lagging=4
+   bin 266221: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.33σ, n_lagging=3
+   bin 271871: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.88σ, n_lagging=6
+   bin 272690: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.37σ, n_lagging=6
+   bin 274229: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=3.65σ, n_lagging=5
+   bin 275955: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.49σ, n_lagging=3
+   bin 277630: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.41σ, n_lagging=3
+   bin 279275: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.07σ, n_lagging=3
+   bin 292450: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.48σ, n_lagging=6
+   bin 309261: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=3
+   bin 334037: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.78σ, n_lagging=5
+   bin 335203: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=6
+   bin 336152: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.81σ, n_lagging=6
+   bin 340167: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.37σ, n_lagging=6
+   bin 366687: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.23σ, n_lagging=6
+   bin 367108: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.56σ, n_lagging=6
+   bin 367338: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.66σ, n_lagging=3
+   bin 370571: anchor=confirmed, confirmer=Bybit Perp, lag=250ms, mag=2.47σ, n_lagging=3
+   bin 378243: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.51σ, n_lagging=5
+   bin 378844: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.19σ, n_lagging=3
+   bin 398334: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=3.02σ, n_lagging=6
+   bin 412029: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.08σ, n_lagging=6
+   bin 414725: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.13σ, n_lagging=7
+   bin 416633: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.76σ, n_lagging=3
+   bin 416861: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.05σ, n_lagging=3
+   bin 420866: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.95σ, n_lagging=4
+   bin 423308: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.17σ, n_lagging=6
+   bin 423720: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.56σ, n_lagging=5
+   bin 427945: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.65σ, n_lagging=6
+   bin 438769: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.38σ, n_lagging=6
+   bin 439253: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.49σ, n_lagging=6
+   bin 445069: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.50σ, n_lagging=6
+   bin 456706: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.75σ, n_lagging=6
+   bin 456839: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.00σ, n_lagging=3
+   bin 459515: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.45σ, n_lagging=6
+   bin 460049: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.10σ, n_lagging=3
+   bin 460447: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.18σ, n_lagging=4
+   bin 460701: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.57σ, n_lagging=6
+   bin 462858: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.13σ, n_lagging=3
+   bin 510716: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.69σ, n_lagging=3
+   bin 519355: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.31σ, n_lagging=7
+   bin 526345: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.05σ, n_lagging=3
+   bin 528370: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.56σ, n_lagging=4
+   bin 528585: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.62σ, n_lagging=3
+   bin 531921: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.12σ, n_lagging=6
+   bin 535906: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.09σ, n_lagging=4
+   bin 537129: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.21σ, n_lagging=9
+   bin 543422: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.62σ, n_lagging=5
+   bin 547366: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.02σ, n_lagging=3
+   bin 599689: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.24σ, n_lagging=5
+   bin 602515: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.56σ, n_lagging=5
+   bin 611116: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.66σ, n_lagging=6
+   bin 634643: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.49σ, n_lagging=3
+   bin 634723: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.83σ, n_lagging=3
+   bin 634964: anchor=confirmed, confirmer=Bybit Perp, lag=150ms, mag=2.05σ, n_lagging=7
+   bin 635116: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.38σ, n_lagging=3
+   bin 635460: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.31σ, n_lagging=3
+   bin 635752: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.59σ, n_lagging=3
+   bin 636051: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=6
+   bin 636634: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.18σ, n_lagging=3
+   bin 636821: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.36σ, n_lagging=8
+   bin 636976: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=3.47σ, n_lagging=3
+   bin 637281: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.70σ, n_lagging=6
+   bin 637407: anchor=confirmed, confirmer=Bybit Perp, lag=200ms, mag=2.24σ, n_lagging=3
+   bin 637510: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.42σ, n_lagging=6
+   bin 637792: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.46σ, n_lagging=5
+   bin 638065: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.79σ, n_lagging=5
+   bin 638225: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.54σ, n_lagging=5
+   bin 638597: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.67σ, n_lagging=3
+   bin 638747: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.25σ, n_lagging=3
+   bin 638826: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.63σ, n_lagging=3
+   bin 639132: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.19σ, n_lagging=3
+   bin 639244: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.27σ, n_lagging=3
+   bin 639447: anchor=confirmed, confirmer=OKX Perp, lag=500ms, mag=2.08σ, n_lagging=3
+   bin 640250: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=6
+   bin 640374: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.89σ, n_lagging=5
+   bin 640491: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.72σ, n_lagging=3
+   bin 640765: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.07σ, n_lagging=3
+   bin 640891: anchor=confirmed, confirmer=Bybit Perp, lag=150ms, mag=2.50σ, n_lagging=3
+   bin 641125: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.33σ, n_lagging=3
+   bin 641549: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.16σ, n_lagging=3
+   bin 641846: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.14σ, n_lagging=3
+   bin 641939: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.37σ, n_lagging=6
+   bin 642837: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.50σ, n_lagging=3
+   bin 643320: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=3
+   bin 643469: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.78σ, n_lagging=3
+   bin 643742: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.46σ, n_lagging=3
+   bin 644525: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.30σ, n_lagging=3
+   bin 644621: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.22σ, n_lagging=3
+   bin 645663: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.18σ, n_lagging=3
+   bin 645787: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.29σ, n_lagging=3
+   bin 645929: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.50σ, n_lagging=3
+   bin 646304: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.30σ, n_lagging=3
+   bin 646516: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.75σ, n_lagging=3
+   bin 646679: anchor=confirmed, confirmer=OKX Perp, lag=500ms, mag=2.37σ, n_lagging=3
+   bin 647112: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=4.08σ, n_lagging=3
+   bin 647326: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.72σ, n_lagging=3
+   bin 648708: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.75σ, n_lagging=3
+   bin 648786: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.30σ, n_lagging=3
+   bin 649160: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.34σ, n_lagging=3
+   bin 649687: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.13σ, n_lagging=5
+   bin 649771: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.08σ, n_lagging=4
+   bin 650023: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=6.24σ, n_lagging=7
+   bin 650137: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.79σ, n_lagging=3
+   bin 650322: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=4.14σ, n_lagging=3
+   bin 650390: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.64σ, n_lagging=3
+   bin 650894: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.91σ, n_lagging=7
+   bin 651364: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.97σ, n_lagging=3
+   bin 652578: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.14σ, n_lagging=5
+   bin 652661: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.13σ, n_lagging=3
+   bin 652730: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.39σ, n_lagging=3
+   bin 652919: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.16σ, n_lagging=3
+   bin 653119: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.31σ, n_lagging=4
+   bin 653221: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.71σ, n_lagging=3
+   bin 653358: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.02σ, n_lagging=3
+   bin 653675: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.25σ, n_lagging=3
+   bin 654055: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.27σ, n_lagging=3
+   bin 654166: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.17σ, n_lagging=5
+   bin 654686: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.65σ, n_lagging=5
+   bin 654837: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.43σ, n_lagging=5
+   bin 655410: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.21σ, n_lagging=6
+   bin 655619: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.34σ, n_lagging=3
+   bin 656171: anchor=confirmed, confirmer=Bybit Perp, lag=500ms, mag=2.33σ, n_lagging=3
+   bin 656458: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.07σ, n_lagging=4
+   bin 656596: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.05σ, n_lagging=3
+   bin 656747: anchor=confirmed, confirmer=Bybit Perp, lag=500ms, mag=2.25σ, n_lagging=3
+   bin 657144: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.88σ, n_lagging=3
+   bin 657624: anchor=confirmed, confirmer=OKX Perp, lag=450ms, mag=2.31σ, n_lagging=3
+   bin 658119: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=3.29σ, n_lagging=3
+   bin 658802: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=5.14σ, n_lagging=7
+   bin 659169: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.52σ, n_lagging=4
+   bin 659292: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.06σ, n_lagging=4
+   bin 659517: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.08σ, n_lagging=3
+   bin 659613: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.44σ, n_lagging=3
+   bin 659825: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.60σ, n_lagging=5
+   bin 661022: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.64σ, n_lagging=3
+   bin 662659: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.52σ, n_lagging=4
+   bin 662724: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.68σ, n_lagging=3
+   bin 662796: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.31σ, n_lagging=4
+   bin 663153: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.67σ, n_lagging=3
+   bin 663224: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.68σ, n_lagging=3
+   bin 663312: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.36σ, n_lagging=3
+   bin 663658: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.74σ, n_lagging=6
+   bin 663780: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.05σ, n_lagging=6
+   bin 663930: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.23σ, n_lagging=5
+   bin 664315: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.19σ, n_lagging=3
+   bin 664752: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 666833: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.09σ, n_lagging=6
+   bin 667119: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.17σ, n_lagging=6
+   bin 667235: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.35σ, n_lagging=3
+   bin 667342: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.08σ, n_lagging=3
+   bin 667890: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.39σ, n_lagging=4
+   bin 668109: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.05σ, n_lagging=3
+   bin 668762: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.21σ, n_lagging=3
+   bin 669054: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=2.55σ, n_lagging=4
+   bin 669293: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.31σ, n_lagging=3
+   bin 669495: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.24σ, n_lagging=3
+   bin 669620: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.39σ, n_lagging=5
+   bin 669898: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.27σ, n_lagging=3
+   bin 671359: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.41σ, n_lagging=3
+   bin 671921: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.36σ, n_lagging=4
+   bin 672258: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.14σ, n_lagging=5
+   bin 672845: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.18σ, n_lagging=3
+   bin 672969: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.24σ, n_lagging=3
+   bin 673392: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.59σ, n_lagging=3
+   bin 673967: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.24σ, n_lagging=3
+   bin 674570: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.48σ, n_lagging=3
+   bin 675904: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.63σ, n_lagging=3
+   bin 675981: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.09σ, n_lagging=3
+   bin 677293: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.23σ, n_lagging=3
+   bin 677459: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.35σ, n_lagging=3
+   bin 679007: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=4.23σ, n_lagging=6
+   bin 679192: anchor=confirmed, confirmer=Bybit Perp, lag=100ms, mag=2.68σ, n_lagging=3
+   bin 679704: anchor=confirmed, confirmer=Bybit Perp, lag=300ms, mag=2.03σ, n_lagging=3
+   bin 679880: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.25σ, n_lagging=3
+   bin 681325: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.41σ, n_lagging=4
+   bin 682183: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.31σ, n_lagging=7
+   bin 683037: anchor=confirmed, confirmer=OKX Perp, lag=300ms, mag=2.36σ, n_lagging=3
+   bin 686229: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.38σ, n_lagging=7
+   bin 687315: anchor=confirmed, confirmer=OKX Perp, lag=200ms, mag=2.25σ, n_lagging=4
+   bin 687719: anchor=confirmed, confirmer=Bybit Perp, lag=350ms, mag=2.05σ, n_lagging=3
+   bin 692871: anchor=confirmed, confirmer=Bybit Perp, lag=50ms, mag=4.40σ, n_lagging=7
+   bin 697356: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.69σ, n_lagging=5
+   bin 697509: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.33σ, n_lagging=3
+   bin 698155: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=4
+   bin 698251: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.71σ, n_lagging=3
+   bin 704771: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.63σ, n_lagging=3
+   bin 706673: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.35σ, n_lagging=3
+   bin 729486: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.07σ, n_lagging=6
+   bin 732732: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.98σ, n_lagging=6
+   bin 737483: anchor=confirmed, confirmer=Bybit Perp, lag=450ms, mag=2.06σ, n_lagging=3
+   bin 740156: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.38σ, n_lagging=4
+   bin 748717: anchor=confirmed, confirmer=Bybit Perp, lag=250ms, mag=2.24σ, n_lagging=3
+   bin 752708: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.62σ, n_lagging=5
+   bin 756691: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.61σ, n_lagging=6
+   bin 766644: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.79σ, n_lagging=5
+   bin 766954: anchor=confirmed, confirmer=OKX Perp, lag=250ms, mag=2.61σ, n_lagging=4
+   bin 772887: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.61σ, n_lagging=6
+   bin 780008: anchor=confirmed, confirmer=OKX Perp, lag=400ms, mag=2.25σ, n_lagging=3
+   bin 781818: anchor=confirmed, confirmer=OKX Perp, lag=150ms, mag=2.30σ, n_lagging=6
+   bin 784408: anchor=confirmed, confirmer=Bybit Perp, lag=200ms, mag=2.16σ, n_lagging=6
+   bin 785994: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.15σ, n_lagging=7
+   bin 786657: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.22σ, n_lagging=3
+   bin 788439: anchor=confirmed, confirmer=OKX Perp, lag=350ms, mag=2.40σ, n_lagging=5
+   bin 798492: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=3.90σ, n_lagging=6
+   bin 821595: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.08σ, n_lagging=5
+   bin 822340: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.10σ, n_lagging=3
+   bin 822462: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=2.93σ, n_lagging=3
+   bin 828717: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.32σ, n_lagging=5
+   bin 828922: anchor=confirmed, confirmer=OKX Perp, lag=100ms, mag=2.70σ, n_lagging=7
+   bin 833680: anchor=confirmed, confirmer=OKX Perp, lag=50ms, mag=2.35σ, n_lagging=6
+   bin 846728: anchor=confirmed, confirmer=Bybit Perp, lag=0ms, mag=3.36σ, n_lagging=6
+
+✅ Дублей нет
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #4
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 4 (v2): Метрики + Grid search + Bootstrap CI
+# ══════════════════════════════════════════════════════════
+from tqdm.auto import tqdm as tqdm_auto
+
+MAX_HORIZON_BINS = 600
+HIT_WINDOW_BINS = 40
+DELAY_GRID_MS = [0, 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000]
+HOLD_GRID_MS  = [100, 200, 500, 1000, 2000, 5000, 10000, 30000]
+N_BOOTSTRAP = 1000
+MIN_COUNT = 5
+np.random.seed(42)
+
+# ═══════ ЧАСТЬ 1: Метрики ═══════
+def compute_metrics(events_list, vwap_df, ema_df, follower):
+    fvals = vwap_df[follower].values
+    f_ema = ema_df[follower].values
+    n_bins = len(fvals)
+    results = []
+    for ev in events_list:
+        if follower not in ev.get('lagging_followers', []):
+            continue
+        t0 = ev['bin_idx']
+        direction = ev['direction']
+        if t0 >= n_bins or np.isnan(fvals[t0]):
+            continue
+        p0 = fvals[t0]
+        leader_name = ev['leader'] if ev['leader'] != 'confirmed' else 'OKX Perp'
+        lvals = vwap_df[leader_name].values
+        if t0 >= len(lvals) or np.isnan(lvals[t0]):
+            continue
+        l_ema0 = ema_df[leader_name].values[t0]
+        if np.isnan(l_ema0): continue
+        leader_move_abs = abs(lvals[t0] - l_ema0)
+        if leader_move_abs < 1e-10: continue
+
+        lag_50, lag_80, mfe, mae = None, None, 0.0, 0.0
+        t50, t80 = 0.5 * leader_move_abs, 0.8 * leader_move_abs
+        t_hit = t0 + HIT_WINDOW_BINS
+        hit = int(direction * (fvals[t_hit] - p0) > 0) if t_hit < n_bins and not np.isnan(fvals[t_hit]) else None
+        for t in range(t0+1, min(t0+MAX_HORIZON_BINS, n_bins)):
+            if np.isnan(fvals[t]): continue
+            move = direction * (fvals[t] - p0)
+            if move > mfe: mfe = move
+            if move < mae: mae = move
+            if lag_50 is None and move >= t50: lag_50 = (t-t0)*BIN_SIZE_MS
+            if lag_80 is None and move >= t80: lag_80 = (t-t0)*BIN_SIZE_MS
+        results.append({
+            'bin_idx': t0, 'ts_ms': ev['ts_ms'], 'signal': ev['signal'],
+            'direction': direction, 'follower': follower,
+            'lag_50_ms': lag_50, 'lag_80_ms': lag_80, 'hit': hit,
+            'mfe_bps': mfe/p0*10000, 'mae_bps': mae/p0*10000,
+            'leader_move_bps': leader_move_abs/lvals[t0]*10000,
+        })
+    return results
+
+all_metrics = []
+combos = [(sig, fol) for sig in ['A','B','C'] for fol in sorted(FOLLOWERS)]
+for sig, fol in tqdm_auto(combos, desc="Метрики"):
+    all_metrics.extend(compute_metrics([e for e in all_events if e['signal']==sig], vwap_df, ema_df, fol))
+metrics_df = pd.DataFrame(all_metrics)
+print(f"\n✅ Метрики: {len(metrics_df)} измерений")
+
+# Сводка — ИСПРАВЛЕНО: форматирование вынесено из f-строки
+print(f"\n{'Follower':<20} {'Sig':>4} {'N':>4} {'Lag50':>7} {'Hit%':>6} {'MFE':>7} {'MAE':>7}")
+print("─"*62)
+for fol in sorted(FOLLOWERS):
+    for sig in ['A','B','C']:
+        sub = metrics_df[(metrics_df['follower']==fol)&(metrics_df['signal']==sig)]
+        if len(sub)==0: continue
+        l50 = sub['lag_50_ms'].dropna()
+        hits = sub['hit'].dropna()
+        lag50_str = f"{l50.median():7.0f}" if len(l50) > 0 else "    nan"
+        hit_str   = f"{hits.mean()*100:5.0f}%" if len(hits) > 0 else "   0%"
+        print(f"  {fol:<18} {sig:>4} {len(sub):>4} {lag50_str} "
+              f"{hit_str} {sub['mfe_bps'].mean():>+6.2f} {sub['mae_bps'].mean():>+6.2f}")
+
+# ═══════ ЧАСТЬ 2: Grid search ═══════
+all_grid = []
+for sig, fol in tqdm_auto(combos, desc="Grid search"):
+    ev_list = [e for e in all_events if e['signal']==sig]
+    fee = FEES.get(fol, 0)
+    fvals = vwap_df[fol].values
+    n_bins = len(fvals)
+    for ev in ev_list:
+        if fol not in ev.get('lagging_followers',[]): continue
+        t0, direction = ev['bin_idx'], ev['direction']
+        for d_ms in DELAY_GRID_MS:
+            t_e = t0 + d_ms//BIN_SIZE_MS
+            if t_e >= n_bins or np.isnan(fvals[t_e]): continue
+            pe = fvals[t_e]
+            for h_ms in HOLD_GRID_MS:
+                t_x = t_e + h_ms//BIN_SIZE_MS
+                if t_x >= n_bins or np.isnan(fvals[t_x]): continue
+                gross = direction*(fvals[t_x]-pe)/pe*10000
+                all_grid.append({'delay_ms':d_ms,'hold_ms':h_ms,'gross_pnl_bps':gross,
+                    'net_pnl_bps':gross-2*fee,'hit':1 if gross>0 else 0,
+                    'signal':sig,'follower':fol,'bin_idx':t0})
+
+grid_df = pd.DataFrame(all_grid)
+print(f"\n✅ Grid: {len(grid_df):,} точек")
+
+agg = grid_df.groupby(['follower','signal','delay_ms','hold_ms']).agg(
+    mean_net=('net_pnl_bps','mean'), mean_gross=('gross_pnl_bps','mean'),
+    std_pnl=('net_pnl_bps','std'), hit_rate=('hit','mean'), count=('hit','count'),
+).reset_index()
+
+valid = agg[agg['count']>=MIN_COUNT]
+if len(valid)==0:
+    print("⚠️ count>=5 нет, снижаем до 3")
+    MIN_COUNT=3; valid=agg[agg['count']>=MIN_COUNT]
+
+best_idx = valid.groupby(['follower','signal'])['mean_net'].idxmax()
+best = valid.loc[best_idx].sort_values('mean_net', ascending=False)
+
+# ═══════ ЧАСТЬ 3: Bootstrap CI ═══════
+def bootstrap_ci(vals, n_iter=N_BOOTSTRAP):
+    vals = np.array(vals); vals = vals[~np.isnan(vals)]
+    if len(vals)<3: return np.nan, np.nan, np.nan
+    means = [np.mean(np.random.choice(vals,len(vals),replace=True)) for _ in range(n_iter)]
+    return np.mean(vals), np.percentile(means,2.5), np.percentile(means,97.5)
+
+ci_results = []
+for _, r in best.iterrows():
+    mask = (grid_df['follower']==r['follower'])&(grid_df['signal']==r['signal'])&\
+           (grid_df['delay_ms']==r['delay_ms'])&(grid_df['hold_ms']==r['hold_ms'])
+    sub = grid_df[mask]
+    if len(sub)<3: continue
+    pm, pl, ph = bootstrap_ci(sub['net_pnl_bps'].values)
+    gm, gl, gh = bootstrap_ci(sub['gross_pnl_bps'].values)
+    hm, hl, hh = bootstrap_ci(sub['hit'].values)
+    std = sub['net_pnl_bps'].std()
+    ci_results.append({**r.to_dict(), 'net_mean':pm,'net_lo':pl,'net_hi':ph,
+        'gross_mean':gm,'hit_mean':hm,'hit_lo':hl,'hit_hi':hh,
+        'sharpe':pm/std if std>0 else 0, 'n':len(sub)})
+
+ci_df = pd.DataFrame(ci_results).sort_values('net_mean',ascending=False)
+
+# ═══════ Финальная таблица ═══════
+print(f"\n{'═'*110}")
+print(f"📊 Итоговая таблица с Bootstrap 95% CI (first-crossing detection)")
+print(f"\n{'Follower':<20} {'Sig':>3} {'D':>5} {'H':>6} {'N':>4} {'Gross':>6} "
+      f"{'Net':>7} {'[95% CI Net]':>20} {'Hit%':>5} {'[95% CI Hit]':>16} {'Shrp':>5}")
+print("─"*110)
+for _,r in ci_df.iterrows():
+    ci = f"[{r['net_lo']:+.2f},{r['net_hi']:+.2f}]"
+    hci = f"[{r['hit_lo']:.0%},{r['hit_hi']:.0%}]"
+    m = "🟢" if r['net_lo']>0 else ("🔴" if r['net_hi']<0 else "🟡")
+    print(f"{m} {r['follower']:<18} {r['signal']:>3} {int(r['delay_ms']):>5} {int(r['hold_ms']):>6} {int(r['n']):>4} "
+          f"{r['gross_mean']:>+5.2f} {r['net_mean']:>+6.2f} {ci:>20} {r['hit_mean']:>4.0%} {hci:>16} {r['sharpe']:>+4.2f}")
+
+prof = ci_df[ci_df['net_lo']>0]
+marg = ci_df[(ci_df['net_lo']<=0)&(ci_df['net_hi']>0)]
+print(f"\n🟢 Profit (CI>0): {len(prof)}  🟡 Маржинальные: {len(marg)}  🔴 Убыток: {len(ci_df)-len(prof)-len(marg)}")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+
+TEXT/PLAIN OUTPUT:
+Метрики:   0%|          | 0/27 [00:00<?, ?it/s]
+
+[ПРОПУЩЕНО: application/vnd.jupyter.widget-view+json]
+
+--- Output #2 ---
+TEXT OUTPUT:
+
+✅ Метрики: 2164 измерений
+
+Follower              Sig    N   Lag50   Hit%     MFE     MAE
+──────────────────────────────────────────────────────────────
+  Binance Perp          A  134     nan     0%  +0.00  +0.00
+  Binance Perp          B  154   16800     0%  +0.05  -0.01
+  Binance Perp          C  229     nan     0%  +0.00  +0.00
+  Binance Spot          A  134     nan     0%  +0.00  +0.00
+  Binance Spot          B  154    6000     0%  +0.09  +0.00
+  Binance Spot          C  229     nan     0%  +0.00  +0.00
+  Bitget Perp           A    8    1925    75%  +8.93  -0.76
+  Bitget Perp           B   22     625    50%  +5.32  -2.82
+  Bitget Perp           C    8     100   100% +16.84  -0.05
+  Bybit Spot            A   30    5600    13%  +4.97  -4.31
+  Bybit Spot            B   21    4625    24% +10.15  -1.13
+  Bybit Spot            C    5      50    20%  +1.55  -2.36
+  Gate Perp             A    4   23500    25%  +8.49  -4.44
+  Gate Perp             B   23     675    57%  +3.97  -2.69
+  Gate Perp             C   15     100   100% +10.82  -0.54
+  Hyperliquid Perp      A  134     nan     0%  +0.00  +0.00
+  Hyperliquid Perp      B  153     nan     0%  +0.00  +0.00
+  Hyperliquid Perp      C  229     nan     0%  +0.00  +0.00
+  Lighter Perp          A   33    1550    45%  +6.21  -6.05
+  Lighter Perp          B   54     300    72%  +7.65  -1.37
+  Lighter Perp          C   73     200    99% +10.76  -1.42
+  MEXC Perp             A   15     375    87%  +8.83  -2.70
+  MEXC Perp             B   42     250    79%  +5.32  -2.55
+  MEXC Perp             C   70     200    96% +10.97  -1.01
+  edgeX Perp            A   25     725    80%  +7.35  -3.65
+  edgeX Perp            B   70     550    81%  +5.49  -2.17
+  edgeX Perp            C   96     500    97% +10.52  -0.89
+
+STREAM OUTPUT (stdout):
+
+✅ Метрики: 2164 измерений
+
+Follower              Sig    N   Lag50   Hit%     MFE     MAE
+──────────────────────────────────────────────────────────────
+  Binance Perp          A  134     nan     0%  +0.00  +0.00
+  Binance Perp          B  154   16800     0%  +0.05  -0.01
+  Binance Perp          C  229     nan     0%  +0.00  +0.00
+  Binance Spot          A  134     nan     0%  +0.00  +0.00
+  Binance Spot          B  154    6000     0%  +0.09  +0.00
+  Binance Spot          C  229     nan     0%  +0.00  +0.00
+  Bitget Perp           A    8    1925    75%  +8.93  -0.76
+  Bitget Perp           B   22     625    50%  +5.32  -2.82
+  Bitget Perp           C    8     100   100% +16.84  -0.05
+  Bybit Spot            A   30    5600    13%  +4.97  -4.31
+  Bybit Spot            B   21    4625    24% +10.15  -1.13
+  Bybit Spot            C    5      50    20%  +1.55  -2.36
+  Gate Perp             A    4   23500    25%  +8.49  -4.44
+  Gate Perp             B   23     675    57%  +3.97  -2.69
+  Gate Perp             C   15     100   100% +10.82  -0.54
+  Hyperliquid Perp      A  134     nan     0%  +0.00  +0.00
+  Hyperliquid Perp      B  153     nan     0%  +0.00  +0.00
+  Hyperliquid Perp      C  229     nan     0%  +0.00  +0.00
+  Lighter Perp          A   33    1550    45%  +6.21  -6.05
+  Lighter Perp          B   54     300    72%  +7.65  -1.37
+  Lighter Perp          C   73     200    99% +10.76  -1.42
+  MEXC Perp             A   15     375    87%  +8.83  -2.70
+  MEXC Perp             B   42     250    79%  +5.32  -2.55
+  MEXC Perp             C   70     200    96% +10.97  -1.01
+  edgeX Perp            A   25     725    80%  +7.35  -3.65
+  edgeX Perp            B   70     550    81%  +5.49  -2.17
+  edgeX Perp            C   96     500    97% +10.52  -0.89
+
+
+--- Output #3 ---
+
+TEXT/PLAIN OUTPUT:
+Grid search:   0%|          | 0/27 [00:00<?, ?it/s]
+
+[ПРОПУЩЕНО: application/vnd.jupyter.widget-view+json]
+
+--- Output #4 ---
+TEXT OUTPUT:
+
+✅ Grid: 207,744 точек
+
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+📊 Итоговая таблица с Bootstrap 95% CI (first-crossing detection)
+
+Follower             Sig     D      H    N  Gross     Net         [95% CI Net]  Hit%     [95% CI Hit]  Shrp
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+🟢 Lighter Perp         C     0  30000   73 +5.94  +5.94        [+3.69,+8.03]  81%        [71%,89%] +0.61
+🟢 Lighter Perp         B     0  30000   54 +3.99  +3.99        [+1.65,+6.74]  69%        [56%,81%] +0.41
+🟢 MEXC Perp            C     0  30000   70 +7.22  +3.22        [+1.04,+5.70]  87%        [79%,94%] +0.32
+🟡 edgeX Perp           C     0  30000   96 +6.38  +1.18        [-0.58,+3.16]  84%        [77%,92%] +0.13
+🟢 Lighter Perp         A     0   5000   33 +1.09  +1.09        [+0.56,+1.70]  42%        [24%,61%] +0.62
+🟡 Bitget Perp          C     0  30000    8 +12.35  +0.35       [-7.17,+10.20] 100%      [100%,100%] +0.03
+🟡 MEXC Perp            A     0  10000   15 +3.89  -0.11        [-2.27,+2.22]  73%        [47%,93%] -0.02
+🔴 MEXC Perp            B     0   2000   42 +2.37  -1.63        [-2.24,-0.99]  79%        [67%,90%] -0.78
+🟡 edgeX Perp           A     0  10000   25 +2.87  -2.33        [-4.63,+0.19]  68%        [48%,84%] -0.37
+🔴 edgeX Perp           B     0   2000   70 +2.64  -2.56        [-3.01,-2.12]  81%        [71%,90%] -1.30
+🟡 Gate Perp            C     0  30000   15 +6.07  -3.93        [-7.87,+1.38]  93%       [80%,100%] -0.40
+🔴 Hyperliquid Perp     B     0    100  153 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Hyperliquid Perp     C     0    100  229 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Hyperliquid Perp     A     0    100  134 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Bitget Perp          A     0  10000    8 +4.80  -7.20        [-9.12,-5.10] 100%      [100%,100%] -2.37
+🔴 Gate Perp            B     0   5000   23 +1.74  -8.26       [-10.10,-5.99]  48%        [30%,70%] -1.57
+🔴 Binance Perp         B  2000  30000  154 +0.08  -8.92        [-9.00,-8.77]   1%          [0%,2%] -9.51
+🔴 Binance Perp         C     0    100  229 +0.00  -9.00        [-9.00,-9.00]   0%          [0%,0%] +0.00
+🔴 Binance Perp         A     0    100  134 +0.00  -9.00        [-9.00,-9.00]   0%          [0%,0%] +0.00
+🔴 Bitget Perp          B     0  10000   22 +1.61 -10.39       [-12.42,-8.12]  50%        [27%,68%] -1.90
+🔴 Bybit Spot           B     0  30000   21 +7.37 -12.63       [-18.32,-5.87]  62%        [43%,81%] -0.82
+🔴 Bybit Spot           A  5000  30000   30 +3.73 -16.27       [-22.05,-9.64]  37%        [20%,53%] -0.93
+🔴 Bybit Spot           C     0   1000    5 +1.55 -18.45      [-20.00,-15.34]  20%         [0%,60%] -5.32
+🔴 Binance Spot         B     0  30000  154 +0.08 -19.92      [-20.00,-19.77]   1%          [0%,2%] -21.25
+🔴 Binance Spot         C     0    100  229 +0.00 -20.00      [-20.00,-20.00]   0%          [0%,0%] +0.00
+🔴 Binance Spot         A     0    100  134 +0.00 -20.00      [-20.00,-20.00]   0%          [0%,0%] +0.00
+
+🟢 Profit (CI>0): 4  🟡 Маржинальные: 5  🔴 Убыток: 17
+
+STREAM OUTPUT (stdout):
+
+✅ Grid: 207,744 точек
+
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+📊 Итоговая таблица с Bootstrap 95% CI (first-crossing detection)
+
+Follower             Sig     D      H    N  Gross     Net         [95% CI Net]  Hit%     [95% CI Hit]  Shrp
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+🟢 Lighter Perp         C     0  30000   73 +5.94  +5.94        [+3.69,+8.03]  81%        [71%,89%] +0.61
+🟢 Lighter Perp         B     0  30000   54 +3.99  +3.99        [+1.65,+6.74]  69%        [56%,81%] +0.41
+🟢 MEXC Perp            C     0  30000   70 +7.22  +3.22        [+1.04,+5.70]  87%        [79%,94%] +0.32
+🟡 edgeX Perp           C     0  30000   96 +6.38  +1.18        [-0.58,+3.16]  84%        [77%,92%] +0.13
+🟢 Lighter Perp         A     0   5000   33 +1.09  +1.09        [+0.56,+1.70]  42%        [24%,61%] +0.62
+🟡 Bitget Perp          C     0  30000    8 +12.35  +0.35       [-7.17,+10.20] 100%      [100%,100%] +0.03
+🟡 MEXC Perp            A     0  10000   15 +3.89  -0.11        [-2.27,+2.22]  73%        [47%,93%] -0.02
+🔴 MEXC Perp            B     0   2000   42 +2.37  -1.63        [-2.24,-0.99]  79%        [67%,90%] -0.78
+🟡 edgeX Perp           A     0  10000   25 +2.87  -2.33        [-4.63,+0.19]  68%        [48%,84%] -0.37
+🔴 edgeX Perp           B     0   2000   70 +2.64  -2.56        [-3.01,-2.12]  81%        [71%,90%] -1.30
+🟡 Gate Perp            C     0  30000   15 +6.07  -3.93        [-7.87,+1.38]  93%       [80%,100%] -0.40
+🔴 Hyperliquid Perp     B     0    100  153 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Hyperliquid Perp     C     0    100  229 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Hyperliquid Perp     A     0    100  134 +0.00  -7.00        [-7.00,-7.00]   0%          [0%,0%] +0.00
+🔴 Bitget Perp          A     0  10000    8 +4.80  -7.20        [-9.12,-5.10] 100%      [100%,100%] -2.37
+🔴 Gate Perp            B     0   5000   23 +1.74  -8.26       [-10.10,-5.99]  48%        [30%,70%] -1.57
+🔴 Binance Perp         B  2000  30000  154 +0.08  -8.92        [-9.00,-8.77]   1%          [0%,2%] -9.51
+🔴 Binance Perp         C     0    100  229 +0.00  -9.00        [-9.00,-9.00]   0%          [0%,0%] +0.00
+🔴 Binance Perp         A     0    100  134 +0.00  -9.00        [-9.00,-9.00]   0%          [0%,0%] +0.00
+🔴 Bitget Perp          B     0  10000   22 +1.61 -10.39       [-12.42,-8.12]  50%        [27%,68%] -1.90
+🔴 Bybit Spot           B     0  30000   21 +7.37 -12.63       [-18.32,-5.87]  62%        [43%,81%] -0.82
+🔴 Bybit Spot           A  5000  30000   30 +3.73 -16.27       [-22.05,-9.64]  37%        [20%,53%] -0.93
+🔴 Bybit Spot           C     0   1000    5 +1.55 -18.45      [-20.00,-15.34]  20%         [0%,60%] -5.32
+🔴 Binance Spot         B     0  30000  154 +0.08 -19.92      [-20.00,-19.77]   1%          [0%,2%] -21.25
+🔴 Binance Spot         C     0    100  229 +0.00 -20.00      [-20.00,-20.00]   0%          [0%,0%] +0.00
+🔴 Binance Spot         A     0    100  134 +0.00 -20.00      [-20.00,-20.00]   0%          [0%,0%] +0.00
+
+🟢 Profit (CI>0): 4  🟡 Маржинальные: 5  🔴 Убыток: 17
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #5
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 5: Сохранение результатов для визуализатора
+# ══════════════════════════════════════════════════════════
+import pickle
+import os
+
+results = {
+    'vwap_df':     vwap_df,
+    'dev_df':      dev_df,
+    'ema_df':      ema_df,
+    'all_events':  all_events,
+    'metrics_df':  metrics_df,
+    'grid_df':     grid_df,
+    'ci_df':       ci_df,
+    't_start':     t_start,
+    'BIN_SIZE_MS': BIN_SIZE_MS,
+    'LEADERS':     LEADERS,
+    'FOLLOWERS':   sorted(FOLLOWERS),
+    'FEES':        FEES,
+}
+
+pkl_path = os.path.join('data', 'analysis_results.pkl')
+with open(pkl_path, 'wb') as f:
+    pickle.dump(results, f)
+
+print(f"✅ Сохранено: {pkl_path} ({os.path.getsize(pkl_path)/1024/1024:.1f} MB)")
+print(f"   all_events: {len(all_events)}, metrics_df: {len(metrics_df)}, grid_df: {len(grid_df)}")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ Сохранено: data/analysis_results.pkl (248.3 MB)
+   all_events: 519, metrics_df: 2164, grid_df: 207744
+
+STREAM OUTPUT (stdout):
+✅ Сохранено: data/analysis_results.pkl (248.3 MB)
+   all_events: 519, metrics_df: 2164, grid_df: 207744
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #6
+==================================================
+
+

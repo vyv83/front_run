@@ -1,0 +1,575 @@
+==================================================
+Code Block #1
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# NOTEBOOK 3: ВИЗУАЛИЗАЦИЯ — Event Explorer
+# Ячейка 1: Загрузка из analysis_results.pkl, сборка JSON
+# ══════════════════════════════════════════════════════════
+import pickle
+import os
+import json
+import numpy as np
+import pandas as pd
+from IPython.display import Markdown, display
+
+DATA_DIR = 'data'
+PKL_PATH = os.path.join(DATA_DIR, 'analysis_results.pkl')
+
+# ── Загрузка ──
+with open(PKL_PATH, 'rb') as f:
+    res = pickle.load(f)
+
+vwap_df    = res['vwap_df']
+dev_df     = res['dev_df']
+ema_df     = res['ema_df']
+all_events = res['all_events']
+metrics_df = res['metrics_df']
+grid_df    = res['grid_df']
+ci_df      = res['ci_df']
+t_start    = res['t_start']
+BIN_SIZE_MS = res['BIN_SIZE_MS']
+LEADERS    = res['LEADERS']
+FOLLOWERS  = res['FOLLOWERS']
+FEES       = res['FEES']
+
+print(f"✅ Загружено из {PKL_PATH}")
+print(f"   all_events: {len(all_events)}, metrics_df: {len(metrics_df)}, grid_df: {len(grid_df)}")
+print(f"   Leaders: {LEADERS}")
+print(f"   Followers: {FOLLOWERS}")
+
+# ── Метрики followers — lookup по (bin_idx, signal, follower) ──
+MAX_HORIZON_BINS = 600
+HIT_WINDOW_BINS  = 40
+
+metrics_lookup = {}
+for ev in all_events:
+    t0        = ev['bin_idx']
+    direction = ev['direction']
+    magnitude = ev['magnitude_sigma']
+    for fol in FOLLOWERS:
+        fvals = vwap_df[fol].values
+        if t0 >= len(fvals) or np.isnan(fvals[t0]):
+            continue
+        p0 = fvals[t0]
+        lag_50, lag_80, mfe, mae = None, None, 0.0, 0.0
+        target_50 = 0.5 * magnitude * p0 * (res['ema_df'][fol].values[t0] if True else 1)
+        # используем bps-движение напрямую через vwap
+        t_hit = t0 + HIT_WINDOW_BINS
+        hit = (int(direction * (fvals[t_hit] - p0) > 0)
+               if t_hit < len(fvals) and not np.isnan(fvals[t_hit]) else None)
+        for t in range(t0 + 1, min(t0 + MAX_HORIZON_BINS, len(fvals))):
+            if np.isnan(fvals[t]):
+                continue
+            move = direction * (fvals[t] - p0)
+            if move > mfe: mfe = move
+            if move < mae: mae = move
+            if lag_50 is None and move >= 0.5 * magnitude * p0: lag_50 = (t - t0) * BIN_SIZE_MS
+            if lag_80 is None and move >= 0.8 * magnitude * p0: lag_80 = (t - t0) * BIN_SIZE_MS
+        metrics_lookup[(t0, ev['signal'], fol)] = {
+            'lag_50_ms': lag_50,
+            'lag_80_ms': lag_80,
+            'hit':       hit,
+            'mfe_bps':   round(mfe / p0 * 10000, 2),
+            'mae_bps':   round(mae / p0 * 10000, 2),
+        }
+
+# ── Сборка JSON ──
+WINDOW_BINS  = 400
+TOP_N_EVENTS = 50
+
+vis_events = sorted(all_events, key=lambda e: e['magnitude_sigma'], reverse=True)[:TOP_N_EVENTS]
+events_json = []
+
+for ev in vis_events:
+    t0        = ev['bin_idx']
+    start_bin = max(0, t0 - WINDOW_BINS // 2)
+    end_bin   = min(len(vwap_df), t0 + WINDOW_BINS // 2)
+    rel_times = [(b - t0) * BIN_SIZE_MS for b in range(start_bin, end_bin)]
+
+    venue_data = {}
+    for venue in LEADERS + FOLLOWERS:
+        vals = vwap_df[venue].iloc[start_bin:end_bin].values
+        venue_data[venue] = [round(float(v), 2) if not np.isnan(v) else None for v in vals]
+
+    follower_metrics = {
+        fol: metrics_lookup.get((t0, ev['signal'], fol), {})
+        for fol in FOLLOWERS
+    }
+
+    events_json.append({
+        'event_id':       len(events_json) + 1,
+        'bin_idx':        t0,
+        'ts_ms':          ev['ts_ms'],
+        'signal':         ev['signal'],
+        'direction':      ev['direction'],
+        'magnitude_bps': round(ev['magnitude_sigma'], 2),
+        'leader':         ev.get('leader', ''),
+        'rel_times_ms':   rel_times,
+        'venues':         venue_data,
+        'follower_metrics': follower_metrics,
+    })
+
+summary = {
+    'total_events': len(all_events),
+    'vis_events':   len(events_json),
+    'leaders':      LEADERS,
+    'followers':    FOLLOWERS,
+    'fees':         {k: v for k, v in FEES.items() if k in FOLLOWERS},
+    'signals':      {
+        'A': sum(1 for e in all_events if e['signal'] == 'A'),
+        'B': sum(1 for e in all_events if e['signal'] == 'B'),
+        'C': sum(1 for e in all_events if e['signal'] == 'C'),
+    },
+}
+
+vis_data = {'summary': summary, 'events': events_json}
+json_path = os.path.join(DATA_DIR, 'events_vis.json')
+with open(json_path, 'w') as f:
+    json.dump(vis_data, f)
+
+file_size_kb = os.path.getsize(json_path) / 1024
+display(Markdown(f"""
+**JSON для визуализации готов:**
+
+| Параметр | Значение |
+|----------|---------|
+| Событий | {len(events_json)} (из {len(all_events)} total) |
+| Signals | A={summary['signals']['A']}, B={summary['signals']['B']}, C={summary['signals']['C']} |
+| Venues | {len(LEADERS)} leaders + {len(FOLLOWERS)} followers |
+| Окно | ±10s ({WINDOW_BINS} bins × {BIN_SIZE_MS}ms) |
+| Файл | `{json_path}` ({file_size_kb:.0f} KB) |
+"""))
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ Загружено из data/analysis_results.pkl
+   all_events: 41, metrics_df: 190, grid_df: 18235
+   Leaders: ['OKX Perp', 'Bybit Perp']
+   Followers: ['Aster Perp', 'Binance Perp', 'Binance Spot', 'Bitget Perp', 'Bybit Spot', 'Gate Perp', 'Hyperliquid Perp', 'Lighter Perp', 'MEXC Perp', 'edgeX Perp']
+
+STREAM OUTPUT (stdout):
+✅ Загружено из data/analysis_results.pkl
+   all_events: 41, metrics_df: 190, grid_df: 18235
+   Leaders: ['OKX Perp', 'Bybit Perp']
+   Followers: ['Aster Perp', 'Binance Perp', 'Binance Spot', 'Bitget Perp', 'Bybit Spot', 'Gate Perp', 'Hyperliquid Perp', 'Lighter Perp', 'MEXC Perp', 'edgeX Perp']
+
+
+--- Output #2 ---
+
+TEXT/MARKDOWN OUTPUT:
+
+**JSON для визуализации готов:**
+
+| Параметр | Значение |
+|----------|---------|
+| Событий | 41 (из 41 total) |
+| Signals | A=13, B=14, C=14 |
+| Venues | 2 leaders + 10 followers |
+| Окно | ±10s (400 bins × 50ms) |
+| Файл | `data/events_vis.json` (1920 KB) |
+
+
+TEXT/PLAIN OUTPUT:
+<IPython.core.display.Markdown object>
+--------------------------------------------------------------------
+
+==================================================
+Code Block #2
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# NOTEBOOK 3: ВИЗУАЛИЗАЦИЯ — Ячейка 2: Explorer HTML
+# ══════════════════════════════════════════════════════════
+
+html_path = os.path.join(DATA_DIR, "explorer.html")
+
+with open(json_path, 'r') as f:
+    json_str = f.read()
+
+html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lead-Lag Explorer</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #0f1117; color: #e0e0e0; padding: 16px; }
+h1 { font-size: 20px; margin-bottom: 8px; color: #fff; }
+.controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            margin-bottom: 12px; padding: 10px; background: #1a1d27; border-radius: 8px; }
+.controls label { font-size: 13px; color: #aaa; }
+.controls select, .controls button { background: #2a2d3a; color: #e0e0e0; border: 1px solid #444;
+  padding: 6px 12px; border-radius: 4px; font-size: 13px; cursor: pointer; }
+.controls button:hover { background: #3a3d4a; }
+.controls button.active { background: #4a6cf7; border-color: #4a6cf7; }
+.info-bar { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 12px;
+            padding: 8px 12px; background: #1a1d27; border-radius: 6px; font-size: 13px; }
+.info-bar .item { display: flex; gap: 4px; }
+.info-bar .label { color: #888; }
+.info-bar .value { color: #fff; font-weight: 600; }
+.info-bar .up { color: #00c853; }
+.info-bar .down { color: #ff5252; }
+.chart-box { background: #1a1d27; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+              gap: 8px; margin-bottom: 12px; }
+.stat-card { background: #1a1d27; border-radius: 8px; padding: 12px; }
+.stat-card h3 { font-size: 12px; color: #888; margin-bottom: 6px; text-transform: uppercase; }
+.stat-card .val { font-size: 22px; font-weight: 700; }
+.positive { color: #00c853; }
+.negative { color: #ff5252; }
+.neutral { color: #aaa; }
+.follower-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.follower-table th { text-align: left; padding: 6px 10px; color: #888; border-bottom: 1px solid #333;
+                     font-weight: 500; font-size: 11px; text-transform: uppercase; }
+.follower-table td { padding: 6px 10px; border-bottom: 1px solid #222; }
+.follower-table tr:hover { background: #22252f; }
+.follower-table tr.selected { background: #1e2a4a; }
+.follower-table tr.not-in-signal { opacity: 0.4; }
+kbd { background: #2a2d3a; padding: 2px 6px; border-radius: 3px; font-size: 11px; border: 1px solid #444; }
+</style>
+</head>
+<body>
+
+<h1>Lead-Lag Event Explorer</h1>
+
+<div class="controls">
+  <div>
+    <label>Event:</label>
+    <button onclick="nav(-1)">&#9664;</button>
+    <select id="selEvent" onchange="loadEvent(this.value)"></select>
+    <button onclick="nav(1)">&#9654;</button>
+  </div>
+  <div>
+    <label>Signal:</label>
+    <button class="sig-btn active" data-sig="all" onclick="filterSig('all')">All</button>
+    <button class="sig-btn" data-sig="A" onclick="filterSig('A')">A (OKX)</button>
+    <button class="sig-btn" data-sig="B" onclick="filterSig('B')">B (Bybit)</button>
+    <button class="sig-btn" data-sig="C" onclick="filterSig('C')">C (Conf)</button>
+  </div>
+  <div>
+    <label>Follower:</label>
+    <select id="selFollower" onchange="replot()"></select>
+  </div>
+  <div style="margin-left:auto; font-size:11px; color:#666;">
+    <kbd>&larr;</kbd> <kbd>&rarr;</kbd> prev/next
+  </div>
+</div>
+
+<div class="info-bar" id="infoBar"></div>
+<div class="chart-box" id="mainChart" style="height:520px;"></div>
+<div class="stats-grid" id="statsGrid"></div>
+<div class="chart-box" style="padding:12px;">
+  <h3 style="font-size:13px; color:#888; margin-bottom:8px;">Follower Metrics for Current Event</h3>
+  <table class="follower-table" id="followerTable">
+    <thead><tr>
+      <th>Follower</th><th>In Signal</th><th>Lag 50%</th><th>Lag 80%</th>
+      <th>Hit</th><th>MFE</th><th>MAE</th><th>Fee</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const DATA = """ + json_str + """;
+const events = DATA.events;
+const summary = DATA.summary;
+let filtered = [...events];
+let currentIdx = 0;
+
+function initUI() {
+  var selF = document.getElementById('selFollower');
+  summary.followers.forEach(function(f) {
+    var o = document.createElement('option'); o.value = f; o.text = f; selF.add(o);
+  });
+  var lIdx = summary.followers.indexOf('Lighter Perp');
+  if (lIdx >= 0) selF.selectedIndex = lIdx;
+  updateEventList();
+}
+
+function updateEventList() {
+  var sel = document.getElementById('selEvent');
+  sel.innerHTML = '';
+  filtered.forEach(function(ev, i) {
+    var o = document.createElement('option');
+    o.value = i;
+    var dir = ev.direction > 0 ? '\\u2191' : '\\u2193';
+    o.text = '#' + ev.event_id + ' ' + ev.signal + ' ' + dir + ' ' + ev.magnitude_bps.toFixed(2) + '\\u03c3';
+    sel.add(o);
+  });
+  if (filtered.length > 0) { currentIdx = 0; loadEvent(0); }
+}
+
+function filterSig(sig) {
+  document.querySelectorAll('.sig-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.sig === sig);
+  });
+  filtered = sig === 'all' ? events.slice() : events.filter(function(e) { return e.signal === sig; });
+  updateEventList();
+}
+
+function nav(delta) {
+  if (!filtered.length) return;
+  currentIdx = (currentIdx + delta + filtered.length) % filtered.length;
+  document.getElementById('selEvent').value = currentIdx;
+  loadEvent(currentIdx);
+}
+
+function loadEvent(idx) {
+  currentIdx = parseInt(idx);
+  var ev = filtered[currentIdx];
+  if (!ev) return;
+  updateInfoBar(ev);
+  replot();
+  updateStats(ev);
+  updateTable(ev);
+}
+
+function normalizeToBps(prices, times) {
+  var t0idx = 0;
+  var minDist = Infinity;
+  times.forEach(function(t, i) {
+    if (Math.abs(t) < minDist) { minDist = Math.abs(t); t0idx = i; }
+  });
+  var p0 = null;
+  for (var i = t0idx; i >= 0; i--) {
+    if (prices[i] !== null) { p0 = prices[i]; break; }
+  }
+  if (!p0) return prices.map(function() { return null; });
+  return prices.map(function(p) { return p !== null ? (p - p0) / p0 * 10000 : null; });
+}
+
+function replot() {
+  var ev = filtered[currentIdx];
+  if (!ev) return;
+  var follower = document.getElementById('selFollower').value;
+  var times = ev.rel_times_ms;
+
+  var leaderNames = ev.signal === 'C' ? summary.leaders : [ev.leader];
+  var leaderColors = ['#4a6cf7', '#f7a04a'];
+  var traces = [];
+
+  leaderNames.forEach(function(lname, li) {
+    var lPrices = ev.venues[lname] || [];
+    var lNorm = normalizeToBps(lPrices, times);
+    var lx = [], ly = [];
+    for (var i = 0; i < times.length; i++) {
+      if (lNorm[i] !== null) { lx.push(times[i]); ly.push(lNorm[i]); }
+    }
+    traces.push({
+      x: lx, y: ly, type: 'scatter', mode: 'lines',
+      line: { color: leaderColors[li], width: 1.5 },
+      name: lname, xaxis: 'x', yaxis: 'y',
+      hovertemplate: '%{x}ms<br>%{y:+.2f}bps<extra>' + lname + '</extra>'
+    });
+  });
+
+  var fPrices = ev.venues[follower] || [];
+  var fNorm = normalizeToBps(fPrices, times);
+  var fx = [], fy = [];
+  for (var i = 0; i < times.length; i++) {
+    if (fNorm[i] !== null) { fx.push(times[i]); fy.push(fNorm[i]); }
+  }
+  traces.push({
+    x: fx, y: fy, type: 'scatter', mode: 'lines',
+    line: { color: '#00c853', width: 1.5 },
+    name: follower, xaxis: 'x', yaxis: 'y2',
+    hovertemplate: '%{x}ms<br>%{y:+.2f}bps<extra>' + follower + '</extra>'
+  });
+
+  var fm = ev.follower_metrics[follower] || {};
+
+  var shapes = [
+    { type:'line', x0:0, x1:0, y0:1, y1:0.52, xref:'x', yref:'paper',
+      line:{ color:'#ff5252', width:2, dash:'dash' } },
+    { type:'line', x0:0, x1:0, y0:0.48, y1:0, xref:'x', yref:'paper',
+      line:{ color:'#ff5252', width:2, dash:'dash' } },
+    { type:'rect', x0:-500, x1:0, y0:1, y1:0.52, xref:'x', yref:'paper',
+      fillcolor:'rgba(255,82,82,0.08)', line:{width:0} },
+    { type:'rect', x0:-500, x1:0, y0:0.48, y1:0, xref:'x', yref:'paper',
+      fillcolor:'rgba(255,82,82,0.08)', line:{width:0} },
+  ];
+
+  if (fm.lag_50_ms != null) {
+    shapes.push({ type:'line', x0:fm.lag_50_ms, x1:fm.lag_50_ms, y0:0.48, y1:0,
+      xref:'x', yref:'paper', line:{ color:'#00c853', width:2, dash:'dot' } });
+  }
+  if (fm.lag_80_ms != null) {
+    shapes.push({ type:'line', x0:fm.lag_80_ms, x1:fm.lag_80_ms, y0:0.48, y1:0,
+      xref:'x', yref:'paper', line:{ color:'#ffd600', width:1.5, dash:'dot' } });
+  }
+
+  var leaderLabel = ev.signal === 'C'
+    ? 'LEADER: OKX (blue) + Bybit (orange)'
+    : 'LEADER: ' + ev.leader;
+
+  var annotations = [
+    { text: leaderLabel, x:0.01, y:1, xref:'paper', yref:'paper',
+      xanchor:'left', yanchor:'top', showarrow:false,
+      font:{ size:12, color: ev.signal === 'C' ? '#f7a04a' : '#4a6cf7' } },
+    { text: 'FOLLOWER: ' + follower, x:0.01, y:0.48, xref:'paper', yref:'paper',
+      xanchor:'left', yanchor:'top', showarrow:false,
+      font:{ size:12, color:'#00c853' } },
+  ];
+
+  if (fm.lag_50_ms != null) {
+    annotations.push({
+      text: 'lag50=' + fm.lag_50_ms + 'ms',
+      x: fm.lag_50_ms, y: 0.48,
+      xref:'x', yref:'paper',
+      xanchor:'left', yanchor:'bottom', showarrow:false,
+      font:{ size:10, color:'#00c853' }
+    });
+  }
+
+  var layout = {
+    xaxis: {
+      title: 'ms from event', color:'#888', gridcolor:'#222',
+      zerolinecolor:'#444', tickfont:{size:10}, domain:[0,1]
+    },
+    yaxis: {
+      title: 'bps from t0', color:'#888', gridcolor:'#222',
+      tickformat:'+.1f', tickfont:{size:10}, domain:[0.52,1],
+      fixedrange: true
+    },
+    yaxis2: {
+      title: 'bps from t0', color:'#888', gridcolor:'#222',
+      tickformat:'+.1f', tickfont:{size:10}, domain:[0,0.48],
+      fixedrange: true
+    },
+    shapes: shapes,
+    annotations: annotations,
+    paper_bgcolor: '#1a1d27',
+    plot_bgcolor: '#1a1d27',
+    margin: { l:70, r:20, t:15, b:45 },
+    hovermode: 'x unified',
+    showlegend: ev.signal === 'C',
+    legend: { x:0.99, y:0.99, xanchor:'right', yanchor:'top',
+              bgcolor:'rgba(0,0,0,0)', font:{size:11} }
+  };
+
+  Plotly.react('mainChart', traces, layout,
+    { responsive:true, displayModeBar:true,
+      modeBarButtonsToRemove:['lasso2d','select2d','toImage','zoomIn2d','zoomOut2d'] });
+}
+
+function updateInfoBar(ev) {
+  var dirClass = ev.direction > 0 ? 'up' : 'down';
+  var dir = ev.direction > 0 ? 'UP' : 'DOWN';
+  var ts = new Date(ev.ts_ms).toISOString().slice(11, 23);
+  var follower = document.getElementById('selFollower').value;
+  var fm = ev.follower_metrics[follower] || {};
+  var leaderLabel = ev.signal === 'C' ? 'OKX + Bybit' : ev.leader;
+  document.getElementById('infoBar').innerHTML =
+    '<div class="item"><span class="label">Event</span><span class="value">#' + ev.event_id + '</span></div>' +
+    '<div class="item"><span class="label">Signal</span><span class="value">' + ev.signal + '</span></div>' +
+    '<div class="item"><span class="label">Direction</span><span class="value ' + dirClass + '">' + dir + '</span></div>' +
+    '<div class="item"><span class="label">Magnitude</span><span class="value">' + ev.magnitude_bps.toFixed(2) + ' \u03c3</span></div>' +
+    '<div class="item"><span class="label">Leader</span><span class="value">' + leaderLabel + '</span></div>' +
+    '<div class="item"><span class="label">Time</span><span class="value">' + ts + '</span></div>' +
+    '<div class="item"><span class="label">Lag50</span><span class="value">' +
+      (fm.lag_50_ms != null ? fm.lag_50_ms + 'ms' : '\u2014') + '</span></div>';
+}
+
+function updateStats(ev) {
+  var follower = document.getElementById('selFollower').value;
+  var fm = ev.follower_metrics[follower] || {};
+  var fee = summary.fees[follower] || 0;
+  var cards = [
+    { label:'Lag 50%', val: fm.lag_50_ms != null ? fm.lag_50_ms+'ms' : '\u2014', cls:'neutral' },
+    { label:'Lag 80%', val: fm.lag_80_ms != null ? fm.lag_80_ms+'ms' : '\u2014', cls:'neutral' },
+    { label:'Hit', val: fm.hit != null ? (fm.hit ? 'YES \u2713':'NO \u2717') : '\u2014',
+      cls: fm.hit ? 'positive' : (fm.hit===0 ? 'negative':'neutral') },
+    { label:'MFE', val: fm.mfe_bps != null ? fm.mfe_bps.toFixed(2)+' bps' : '\u2014', cls:'positive' },
+    { label:'MAE', val: fm.mae_bps != null ? fm.mae_bps.toFixed(2)+' bps' : '\u2014', cls:'negative' },
+    { label:'Taker Fee (RT)', val: (2*fee).toFixed(1)+' bps', cls:'neutral' },
+  ];
+  document.getElementById('statsGrid').innerHTML = cards.map(function(c) {
+    return '<div class="stat-card"><h3>'+c.label+'</h3><div class="val '+c.cls+'">'+c.val+'</div></div>';
+  }).join('');
+}
+
+function updateTable(ev) {
+  var tbody = document.querySelector('#followerTable tbody');
+  var selFollower = document.getElementById('selFollower').value;
+  var lagging = ev.lagging_followers || [];
+  var rows = summary.followers.map(function(fol) {
+    var fm = ev.follower_metrics[fol] || {};
+    var fee = summary.fees[fol] || 0;
+    var inSig = lagging.indexOf(fol) >= 0;
+    var sel = fol === selFollower ? 'selected' : '';
+    var notIn = inSig ? '' : 'not-in-signal';
+    var lag50 = fm.lag_50_ms != null ? fm.lag_50_ms+'ms' : '\u2014';
+    var lag80 = fm.lag_80_ms != null ? fm.lag_80_ms+'ms' : '\u2014';
+    var hit = fm.hit != null ? (fm.hit
+      ? '<span class="positive">\u2713</span>'
+      : '<span class="negative">\u2717</span>') : '\u2014';
+    var mfe = fm.mfe_bps != null ? '<span class="positive">+'+fm.mfe_bps.toFixed(2)+'</span>' : '\u2014';
+    var mae = fm.mae_bps != null ? '<span class="negative">'+fm.mae_bps.toFixed(2)+'</span>' : '\u2014';
+    var inSigBadge = inSig
+      ? '<span style="color:#00c853">\u2713 yes</span>'
+      : '<span style="color:#555">\u2014</span>';
+    return '<tr class="'+sel+' '+notIn+'" style="cursor:pointer;" onclick="' +
+      'document.getElementById(\\'selFollower\\').value=\\''+fol+'\\';' +
+      'replot();updateStats(filtered['+currentIdx+']);updateTable(filtered['+currentIdx+']);">' +
+      '<td>'+fol+'</td><td>'+inSigBadge+'</td><td>'+lag50+'</td><td>'+lag80+'</td>' +
+      '<td>'+hit+'</td><td>'+mfe+'</td><td>'+mae+'</td><td>'+fee.toFixed(1)+'</td></tr>';
+  });
+  tbody.innerHTML = rows.join('');
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'ArrowLeft') nav(-1);
+  if (e.key === 'ArrowRight') nav(1);
+});
+
+initUI();
+</script>
+</body>
+</html>""";
+
+with open(html_path, 'w') as f:
+    f.write(html_content)
+
+file_size_mb = os.path.getsize(html_path) / (1024 * 1024)
+display(Markdown(f"""
+**Explorer обновлён:**
+
+| Параметр | Значение |
+|----------|---------|
+| Файл | `{html_path}` |
+| Размер | {file_size_mb:.1f} MB |
+| Зум | Только по оси X |
+| Y-ось | Автомасштаб по данным |
+"""))
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+
+TEXT/MARKDOWN OUTPUT:
+
+**Explorer обновлён:**
+
+| Параметр | Значение |
+|----------|---------|
+| Файл | `data/explorer.html` |
+| Размер | 1.9 MB |
+| Зум | Только по оси X |
+| Y-ось | Автомасштаб по данным |
+
+
+TEXT/PLAIN OUTPUT:
+<IPython.core.display.Markdown object>
+--------------------------------------------------------------------
+
+==================================================
+Code Block #3
+==================================================
+
+
