@@ -1,0 +1,970 @@
+==================================================
+Code Block #1
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 1: Импорты, VenueConfig, Registry, Константы
+# ══════════════════════════════════════════════════════════
+
+import asyncio
+import json
+import time
+import os
+import sys
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+from datetime import datetime, timezone
+# В конец Ячейки 1 (после nest_asyncio)
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+import websockets
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
+import numpy as np
+from tqdm.auto import tqdm
+
+# nest_asyncio для Jupyter
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+    print("✅ nest_asyncio applied")
+except ImportError:
+    print("⚠️ nest_asyncio не найден, установи: pip install nest_asyncio")
+
+# ─── Логирование ───
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger("collector")
+
+# ─── VenueConfig ───
+@dataclass
+class VenueConfig:
+    name: str                          # уникальное имя, напр. 'OKX Perp'
+    role: str                          # 'leader' | 'follower'
+    
+    # --- Trades WebSocket ---
+    ws_url: str                        # wss://...
+    subscribe_msg: Any = None          # dict | None | 'DYNAMIC'
+    subscribe_factory: Callable = None # вызывается если subscribe_msg == 'DYNAMIC'
+    parser: Callable = None            # fn(msg_dict, ts_local_ms) → list[tick_dict]
+    
+    # --- BBO (опционально, тот же WS) ---
+    bbo_subscribe_msg: Any = None      # None = нет BBO для этой биржи
+    bbo_parser: Callable = None        # fn(msg_dict, ts_local_ms) → bbo_dict | None
+    
+    # --- Keepalive ---
+    keepalive_type: str = None         # 'text_ping' | 'json_ping' | 'ws_ping' | 'edgex_pong' | None
+    keepalive_msg: Any = None          # payload для json_ping
+    keepalive_interval: int = 0        # секунды, 0 = нет keepalive
+    
+    # --- Метаданные ---
+    taker_fee_bps: float = 0.0
+    contract_size: float = 1.0         # множитель qty для пересчёта в BTC
+
+# ─── Registry ───
+VENUES: dict[str, VenueConfig] = {}
+
+def register_venue(cfg: VenueConfig):
+    VENUES[cfg.name] = cfg
+
+# ─── Константы сессии ───
+SESSION_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+TICKS_PATH = os.path.join(DATA_DIR, f"ticks_{SESSION_ID}.parquet")
+BBO_PATH   = os.path.join(DATA_DIR, f"bbo_{SESSION_ID}.parquet")
+
+# ─── Parquet Schemas ───
+TICK_SCHEMA = pa.schema([
+    ('ts_ms',          pa.int64()),
+    ('ts_exchange_ms', pa.int64()),
+    ('price',          pa.float64()),
+    ('qty',            pa.float64()),
+    ('side',           pa.string()),
+    ('venue',          pa.string()),
+])
+
+BBO_SCHEMA = pa.schema([
+    ('ts_ms',      pa.int64()),
+    ('bid_price',  pa.float64()),
+    ('bid_qty',    pa.float64()),
+    ('ask_price',  pa.float64()),
+    ('ask_qty',    pa.float64()),
+    ('venue',      pa.string()),
+])
+
+# ─── Глобальные счётчики ───
+tick_counts = {}    # venue → count
+bbo_counts = {}     # venue → count
+venue_errors = {}   # venue → last error string
+venue_status = {}   # venue → 'ok' | 'error' | 'connecting'
+
+print(f"✅ Сессия: {SESSION_ID}")
+print(f"📁 Данные: {TICKS_PATH}")
+print(f"📁 BBO:    {BBO_PATH}")
+print(f"📋 Tick schema: {TICK_SCHEMA.names}")
+print(f"📋 BBO schema:  {BBO_SCHEMA.names}")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ nest_asyncio applied
+✅ Сессия: 20260411_164417
+📁 Данные: data/ticks_20260411_164417.parquet
+📁 BBO:    data/bbo_20260411_164417.parquet
+📋 Tick schema: ['ts_ms', 'ts_exchange_ms', 'price', 'qty', 'side', 'venue']
+📋 BBO schema:  ['ts_ms', 'bid_price', 'bid_qty', 'ask_price', 'ask_qty', 'venue']
+
+STREAM OUTPUT (stdout):
+✅ nest_asyncio applied
+✅ Сессия: 20260411_164417
+📁 Данные: data/ticks_20260411_164417.parquet
+📁 BBO:    data/bbo_20260411_164417.parquet
+📋 Tick schema: ['ts_ms', 'ts_exchange_ms', 'price', 'qty', 'side', 'venue']
+📋 BBO schema:  ['ts_ms', 'bid_price', 'bid_qty', 'ask_price', 'ask_qty', 'venue']
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #2
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 2: Парсеры trades, BBO, динамические фабрики
+# ══════════════════════════════════════════════════════════
+
+# ═══════════════ TRADES: ЛИДЕРЫ ═══════════════
+
+def parse_okx_trade(msg, ts):
+    if msg.get('arg',{}).get('channel') != 'trades' or 'data' not in msg:
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d['ts']),
+             'price': float(d['px']), 'qty': float(d['sz']),
+             'side': d['side']} for d in msg['data']]
+
+def parse_bybit_trade(msg, ts):
+    if not msg.get('topic','').startswith('publicTrade') or 'data' not in msg:
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d['T']),
+             'price': float(d['p']), 'qty': float(d['v']),
+             'side': d['S'].lower()} for d in msg['data']]
+
+# ═══════════════ TRADES: FOLLOWERS CEX ═══════════════
+
+def parse_binance_trade(msg, ts):
+    data = msg.get('data', msg)
+    if data.get('e') != 'trade':
+        return []
+    p, q = float(data['p']), float(data['q'])
+    if p <= 0 or q <= 0:
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(data['T']),
+             'price': p, 'qty': q,
+             'side': 'sell' if data.get('m') else 'buy'}]
+
+def parse_mexc_trade(msg, ts):
+    if msg.get('channel') != 'push.deal':
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d['t']),
+             'price': float(d['p']),
+             'qty': float(d['v']) * 0.0001,
+             'side': 'buy' if d.get('T') == 1 else 'sell'}
+            for d in msg.get('data', [])]
+
+def parse_bitget_trade(msg, ts):
+    if msg.get('arg',{}).get('channel') != 'trade' or 'data' not in msg:
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d['ts']),
+             'price': float(d['price']), 'qty': float(d['size']),
+             'side': d['side'].lower()} for d in msg['data']]
+
+def parse_gate_trade(msg, ts):
+    if msg.get('channel') != 'futures.trades' or msg.get('event') != 'update':
+        return []
+    ticks = []
+    for d in msg.get('result', []):
+        size = d.get('size', 0)
+        ts_ex = d.get('create_time_ms', int(d.get('create_time', 0)) * 1000)
+        ticks.append({'ts_ms': ts, 'ts_exchange_ms': int(ts_ex),
+                      'price': float(d['price']),
+                      'qty': abs(size) * 0.0001,
+                      'side': 'buy' if size > 0 else 'sell'})
+    return ticks
+
+# ═══════════════ TRADES: FOLLOWERS DEX ═══════════════
+
+def parse_hyperliquid_trade(msg, ts):
+    if msg.get('channel') != 'trades':
+        return []
+    ticks = []
+    for d in msg.get('data', []):
+        raw = str(d.get('side', '')).lower()
+        if raw in ('b', 'buy', 'long'):
+            side = 'buy'
+        elif raw in ('a', 'sell', 'short'):
+            side = 'sell'
+        else:
+            side = 'unknown'
+        ticks.append({'ts_ms': ts, 'ts_exchange_ms': int(d.get('time', 0)),
+                      'price': float(d['px']), 'qty': float(d['sz']),
+                      'side': side})
+    return ticks
+
+def parse_lighter_trade(msg, ts):
+    if msg.get('type') != 'update/trade':
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d.get('timestamp', 0)),
+             'price': float(d['price']), 'qty': float(d['size']),
+             'side': 'sell' if d.get('is_maker_ask') else 'buy'}
+            for d in msg.get('trades', [])]
+
+def parse_edgex_trade(msg, ts):
+    if msg.get('type') != 'quote-event':
+        return []
+    content = msg.get('content', {})
+    if not content.get('channel', '').startswith('trades.'):
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(d.get('time', 0)),
+             'price': float(d['price']), 'qty': float(d['size']),
+             'side': 'sell' if d.get('isBuyerMaker') else 'buy'}
+            for d in content.get('data', [])]
+
+def parse_aster_trade(msg, ts):
+    data = msg.get('data', msg)
+    if data.get('e') != 'aggTrade':
+        return []
+    return [{'ts_ms': ts, 'ts_exchange_ms': int(data['T']),
+             'price': float(data['p']), 'qty': float(data['q']),
+             'side': 'sell' if data.get('m') else 'buy'}]
+
+# ═══════════════ BBO ПАРСЕРЫ ═══════════════
+
+def parse_okx_bbo(msg, ts):
+    if msg.get('arg',{}).get('channel') != 'bbo-tbt' or 'data' not in msg:
+        return None
+    d = msg['data'][0]
+    return {'ts_ms': ts,
+            'bid_price': float(d['bids'][0][0]), 'bid_qty': float(d['bids'][0][1]),
+            'ask_price': float(d['asks'][0][0]), 'ask_qty': float(d['asks'][0][1])}
+
+def parse_bybit_bbo(msg, ts):
+    if not msg.get('topic','').startswith('orderbook.1') or 'data' not in msg:
+        return None
+    d = msg['data']
+    b, a = d.get('b', []), d.get('a', [])
+    if not b or not a:
+        return None
+    return {'ts_ms': ts,
+            'bid_price': float(b[0][0]), 'bid_qty': float(b[0][1]),
+            'ask_price': float(a[0][0]), 'ask_qty': float(a[0][1])}
+
+def parse_binance_bbo(msg, ts):
+    data = msg.get('data', msg)
+    if data.get('e') in ('trade', 'aggTrade') or 'b' not in data or 'a' not in data:
+        return None
+    return {'ts_ms': ts,
+            'bid_price': float(data['b']), 'bid_qty': float(data['B']),
+            'ask_price': float(data['a']), 'ask_qty': float(data['A'])}
+
+def parse_bitget_bbo(msg, ts):
+    if msg.get('arg',{}).get('channel') != 'books1' or 'data' not in msg:
+        return None
+    d = msg['data'][0]
+    b, a = d.get('bids', []), d.get('asks', [])
+    if not b or not a:
+        return None
+    return {'ts_ms': ts,
+            'bid_price': float(b[0][0]), 'bid_qty': float(b[0][1]),
+            'ask_price': float(a[0][0]), 'ask_qty': float(a[0][1])}
+
+def parse_lighter_bbo(msg, ts):
+    if msg.get('type') != 'update/ticker':
+        return None
+    t = msg.get('ticker', {})
+    b, a = t.get('b', {}), t.get('a', {})
+    if not b.get('price') or not a.get('price'):
+        return None
+    return {'ts_ms': ts,
+            'bid_price': float(b['price']), 'bid_qty': float(b['size']),
+            'ask_price': float(a['price']), 'ask_qty': float(a['size'])}
+
+def parse_edgex_bbo(msg, ts):
+    if msg.get('type') != 'quote-event':
+        return None
+    content = msg.get('content', {})
+    if not content.get('channel', '').startswith('bookTicker'):
+        return None
+    for d in content.get('data', []):
+        if str(d.get('contractId')) == '10000001':
+            bp = float(d.get('bestBidPrice', 0))
+            ap = float(d.get('bestAskPrice', 0))
+            if bp > 0 and ap > 0:
+                return {'ts_ms': ts,
+                        'bid_price': bp, 'bid_qty': float(d.get('bestBidSize', 0)),
+                        'ask_price': ap, 'ask_qty': float(d.get('bestAskSize', 0))}
+    return None
+
+def parse_aster_bbo(msg, ts):
+    return parse_binance_bbo(msg, ts)
+
+# ═══════════════ ДИНАМИЧЕСКИЕ ФАБРИКИ ═══════════════
+
+def make_gate_subscribe():
+    return {"time": int(time.time()), "channel": "futures.trades",
+            "event": "subscribe", "payload": ["BTC_USDT"]}
+
+# ═══════════════ ЗАМЕНА make_lighter_subscribe ═══════════════
+
+_lighter_market_id_cache = None  # кэш между reconnect-ами
+
+def make_lighter_subscribe():
+    global _lighter_market_id_cache
+    
+    if _lighter_market_id_cache is not None:
+        btc_id = _lighter_market_id_cache
+        print(f"  Lighter: используем кэшированный market_id = {btc_id}")
+    else:
+        btc_id = 1  # fallback
+        urls = [
+            'https://mainnet.zklighter.elliot.ai/api/v1/markets',
+            'https://zklighter.elliot.ai/api/v1/markets',
+        ]
+        for url in urls:
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': 'application/json',
+                })
+                resp = urllib.request.urlopen(req, timeout=10)
+                markets = json.loads(resp.read())
+                for m in markets:
+                    if 'BTC' in m.get('symbol', '').upper():
+                        btc_id = m.get('market_index', m.get('market_id', 1))
+                        break
+                _lighter_market_id_cache = btc_id
+                print(f"  Lighter: BTC market_id = {btc_id} (от {url})")
+                break
+            except Exception as e:
+                print(f"  Lighter: REST failed ({url}: {e})")
+        
+        if _lighter_market_id_cache is None:
+            _lighter_market_id_cache = btc_id
+            print(f"  Lighter: все REST-эндпоинты недоступны, fallback market_id = {btc_id}")
+    
+    return [
+        {"type": "subscribe", "channel": f"trade/{btc_id}"},
+        {"type": "subscribe", "channel": f"ticker/{btc_id}"},
+    ]
+
+
+# ─── Итог ───
+_parsers = [f for f in dir() if f.startswith('parse_')]
+_factories = [f for f in dir() if f.startswith('make_')]
+print(f"✅ Парсеры trades + BBO: {len(_parsers)} функций")
+print(f"✅ Фабрики subscribe: {len(_factories)} функций")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ Парсеры trades + BBO: 17 функций
+✅ Фабрики subscribe: 2 функций
+
+STREAM OUTPUT (stdout):
+✅ Парсеры trades + BBO: 17 функций
+✅ Фабрики subscribe: 2 функций
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #3
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 3: Регистрация всех 12 бирж (2 лидера + 10 followers)
+# ══════════════════════════════════════════════════════════
+
+VENUES.clear()
+
+# ═══════════════ ЛИДЕРЫ ═══════════════
+
+register_venue(VenueConfig(
+    name='OKX Perp', role='leader',
+    ws_url='wss://ws.okx.com:8443/ws/v5/public',
+    subscribe_msg={"op": "subscribe", "args": [{"channel": "trades", "instId": "BTC-USDT-SWAP"}]},
+    parser=parse_okx_trade,
+    bbo_subscribe_msg={"op": "subscribe", "args": [{"channel": "bbo-tbt", "instId": "BTC-USDT-SWAP"}]},
+    bbo_parser=parse_okx_bbo,
+    keepalive_type='text_ping', keepalive_interval=25,
+    taker_fee_bps=5.0,
+))
+
+register_venue(VenueConfig(
+    name='Bybit Perp', role='leader',
+    ws_url='wss://stream.bybit.com/v5/public/linear',
+    subscribe_msg={"op": "subscribe", "args": ["publicTrade.BTCUSDT"]},
+    parser=parse_bybit_trade,
+    bbo_subscribe_msg={"op": "subscribe", "args": ["orderbook.1.BTCUSDT"]},
+    bbo_parser=parse_bybit_bbo,
+    keepalive_type='ws_ping', keepalive_interval=20,
+    taker_fee_bps=5.5,
+))
+
+# ═══════════════ FOLLOWERS: CEX ═══════════════
+
+register_venue(VenueConfig(
+    name='Binance Perp', role='follower',
+    ws_url='wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@bookTicker',
+    subscribe_msg=None,
+    parser=parse_binance_trade,
+    bbo_parser=parse_binance_bbo,
+    taker_fee_bps=4.5,
+))
+
+register_venue(VenueConfig(
+    name='Binance Spot', role='follower',
+    ws_url='wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker',
+    subscribe_msg=None,
+    parser=parse_binance_trade,
+    bbo_parser=parse_binance_bbo,
+    taker_fee_bps=10.0,
+))
+
+register_venue(VenueConfig(
+    name='Bybit Spot', role='follower',
+    ws_url='wss://stream.bybit.com/v5/public/spot',
+    subscribe_msg={"op": "subscribe", "args": ["publicTrade.BTCUSDT"]},
+    parser=parse_bybit_trade,
+    bbo_subscribe_msg={"op": "subscribe", "args": ["orderbook.1.BTCUSDT"]},
+    bbo_parser=parse_bybit_bbo,
+    keepalive_type='ws_ping', keepalive_interval=20,
+    taker_fee_bps=10.0,
+))
+
+register_venue(VenueConfig(
+    name='MEXC Perp', role='follower',
+    ws_url='wss://contract.mexc.com/edge',
+    subscribe_msg={"method": "sub.deal", "param": {"symbol": "BTC_USDT"}},
+    parser=parse_mexc_trade,
+    keepalive_type='json_ping', keepalive_msg={"method": "ping"}, keepalive_interval=15,
+    taker_fee_bps=2.0,
+    contract_size=0.0001,
+))
+
+register_venue(VenueConfig(
+    name='Bitget Perp', role='follower',
+    ws_url='wss://ws.bitget.com/v2/ws/public',
+    subscribe_msg={"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "trade", "instId": "BTCUSDT"}]},
+    parser=parse_bitget_trade,
+    bbo_subscribe_msg={"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "books1", "instId": "BTCUSDT"}]},
+    bbo_parser=parse_bitget_bbo,
+    keepalive_type='text_ping', keepalive_interval=30,
+    taker_fee_bps=6.0,
+))
+
+register_venue(VenueConfig(
+    name='Gate Perp', role='follower',
+    ws_url='wss://fx-ws.gateio.ws/v4/ws/usdt',
+    subscribe_msg='DYNAMIC',
+    subscribe_factory=make_gate_subscribe,
+    parser=parse_gate_trade,
+    keepalive_type='json_ping', keepalive_msg={"channel": "futures.ping"}, keepalive_interval=15,
+    taker_fee_bps=5.0,
+    contract_size=0.0001,
+))
+
+# ═══════════════ FOLLOWERS: DEX ═══════════════
+
+register_venue(VenueConfig(
+    name='Hyperliquid Perp', role='follower',
+    ws_url='wss://api.hyperliquid.xyz/ws',
+    subscribe_msg={"method": "subscribe", "subscription": {"type": "trades", "coin": "BTC"}},
+    parser=parse_hyperliquid_trade,
+    taker_fee_bps=3.5,
+))
+
+register_venue(VenueConfig(
+    name='Lighter Perp', role='follower',
+    ws_url='wss://mainnet.zklighter.elliot.ai/stream',
+    subscribe_msg='DYNAMIC',
+    subscribe_factory=make_lighter_subscribe,
+    parser=parse_lighter_trade,
+    bbo_parser=parse_lighter_bbo,
+    keepalive_type='ws_ping', keepalive_interval=60,
+    taker_fee_bps=0.0,
+))
+
+register_venue(VenueConfig(
+    name='edgeX Perp', role='follower',
+    ws_url='wss://quote.edgex.exchange/api/v1/public/ws',
+    subscribe_msg={"type": "subscribe", "channel": "trades.10000001"},
+    parser=parse_edgex_trade,
+    bbo_subscribe_msg={"type": "subscribe", "channel": "bookTicker.all.1s"},
+    bbo_parser=parse_edgex_bbo,
+    keepalive_type='edgex_pong',
+    taker_fee_bps=2.6,
+))
+
+register_venue(VenueConfig(
+    name='Aster Perp', role='follower',
+    ws_url='wss://fstream.asterdex.com/ws/btcusdt@aggTrade/btcusdt@bookTicker',
+    subscribe_msg=None,
+    parser=parse_aster_trade,
+    bbo_parser=parse_aster_bbo,
+    taker_fee_bps=2.0,
+))
+
+# ─── Итог ───
+leaders = [v for v in VENUES.values() if v.role == 'leader']
+followers = [v for v in VENUES.values() if v.role == 'follower']
+bbo_venues = [v for v in VENUES.values() if v.bbo_parser is not None]
+
+print(f"✅ {len(VENUES)} бирж зарегистрировано: {len(leaders)} лидеров, {len(followers)} followers")
+print(f"📊 BBO доступен для {len(bbo_venues)} бирж: {', '.join(v.name for v in bbo_venues)}")
+print()
+print(f"{'Venue':<20} {'Role':<10} {'Fee bps':<10} {'BBO':<5} {'Keepalive':<12}")
+print("─" * 60)
+for v in VENUES.values():
+    bbo = "✅" if v.bbo_parser else "—"
+    ka = v.keepalive_type or "—"
+    print(f"{v.name:<20} {v.role:<10} {v.taker_fee_bps:<10.1f} {bbo:<5} {ka:<12}")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ 12 бирж зарегистрировано: 2 лидеров, 10 followers
+📊 BBO доступен для 9 бирж: OKX Perp, Bybit Perp, Binance Perp, Binance Spot, Bybit Spot, Bitget Perp, Lighter Perp, edgeX Perp, Aster Perp
+
+Venue                Role       Fee bps    BBO   Keepalive   
+────────────────────────────────────────────────────────────
+OKX Perp             leader     5.0        ✅     text_ping   
+Bybit Perp           leader     5.5        ✅     ws_ping     
+Binance Perp         follower   4.5        ✅     —           
+Binance Spot         follower   10.0       ✅     —           
+Bybit Spot           follower   10.0       ✅     ws_ping     
+MEXC Perp            follower   2.0        —     json_ping   
+Bitget Perp          follower   6.0        ✅     text_ping   
+Gate Perp            follower   5.0        —     json_ping   
+Hyperliquid Perp     follower   3.5        —     —           
+Lighter Perp         follower   0.0        ✅     ws_ping     
+edgeX Perp           follower   2.6        ✅     edgex_pong  
+Aster Perp           follower   2.0        ✅     —           
+
+STREAM OUTPUT (stdout):
+✅ 12 бирж зарегистрировано: 2 лидеров, 10 followers
+📊 BBO доступен для 9 бирж: OKX Perp, Bybit Perp, Binance Perp, Binance Spot, Bybit Spot, Bitget Perp, Lighter Perp, edgeX Perp, Aster Perp
+
+Venue                Role       Fee bps    BBO   Keepalive   
+────────────────────────────────────────────────────────────
+OKX Perp             leader     5.0        ✅     text_ping   
+Bybit Perp           leader     5.5        ✅     ws_ping     
+Binance Perp         follower   4.5        ✅     —           
+Binance Spot         follower   10.0       ✅     —           
+Bybit Spot           follower   10.0       ✅     ws_ping     
+MEXC Perp            follower   2.0        —     json_ping   
+Bitget Perp          follower   6.0        ✅     text_ping   
+Gate Perp            follower   5.0        —     json_ping   
+Hyperliquid Perp     follower   3.5        —     —           
+Lighter Perp         follower   0.0        ✅     ws_ping     
+edgeX Perp           follower   2.6        ✅     edgex_pong  
+Aster Perp           follower   2.0        ✅     —           
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #4
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 4: Async Engine — СТРОГАЯ РОТАЦИЯ 30 МИНУТ
+# ══════════════════════════════════════════════════════════
+
+import random
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import asyncio
+import json
+import time
+import os
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime, timezone
+from tqdm.auto import tqdm
+import websockets
+
+# Глобальные переменные
+if 'DATA_DIR' not in globals(): DATA_DIR = "data"
+venue_reconnects = {}   
+venue_last_error_ts = {} 
+
+async def keepalive_task(ws, cfg: VenueConfig):
+    try:
+        while True:
+            await asyncio.sleep(cfg.keepalive_interval)
+            if cfg.keepalive_type == 'text_ping': await ws.send("ping")
+            elif cfg.keepalive_type == 'json_ping': await ws.send(json.dumps(cfg.keepalive_msg))
+    except (asyncio.CancelledError, Exception): pass
+
+async def ws_venue_task(cfg: VenueConfig, trades_queue: asyncio.Queue,
+                        bbo_queue: asyncio.Queue, stop_event: asyncio.Event):
+    BACKOFF_BASE, BACKOFF_CAP, STABLE_THRESHOLD = 1.0, 60.0, 60.0
+    venue_status[cfg.name] = 'connecting'
+    tick_counts.setdefault(cfg.name, 0); bbo_counts.setdefault(cfg.name, 0); venue_reconnects.setdefault(cfg.name, 0)
+    attempt = 0
+
+    while not stop_event.is_set():
+        connect_time = None
+        try:
+            ws_kwargs = dict(close_timeout=5, max_size=10_000_000, open_timeout=15)
+            if cfg.keepalive_type == 'ws_ping':
+                ws_kwargs['ping_interval'], ws_kwargs['ping_timeout'] = cfg.keepalive_interval, 10
+            else:
+                ws_kwargs['ping_interval'] = ws_kwargs['ping_timeout'] = None
+
+            venue_status[cfg.name] = 'connecting'
+            async with websockets.connect(cfg.ws_url, **ws_kwargs) as ws:
+                connect_time = time.time()
+                venue_status[cfg.name] = 'ok'
+                if attempt > 0: venue_reconnects[cfg.name] += 1
+                
+                if cfg.subscribe_msg == 'DYNAMIC' and cfg.subscribe_factory:
+                    res = cfg.subscribe_factory()
+                    for s in (res if isinstance(res, list) else [res]): await ws.send(json.dumps(s))
+                elif cfg.subscribe_msg is not None: await ws.send(json.dumps(cfg.subscribe_msg))
+                if cfg.bbo_subscribe_msg: await ws.send(json.dumps(cfg.bbo_subscribe_msg))
+
+                ka_task = asyncio.create_task(keepalive_task(ws, cfg)) if cfg.keepalive_type in ('text_ping', 'json_ping') else None
+                try:
+                    async for raw in ws:
+                        if stop_event.is_set(): break
+                        ts_local = int(time.time_ns() // 1_000_000)
+                        try: msg = json.loads(raw)
+                        except: continue
+                        if not isinstance(msg, dict): continue
+                        if msg.get('event') in ('subscribe', 'subscribed', 'info', 'pong') or msg.get('type') in ('connected', 'pong', 'subscribed'): continue
+                        if msg.get('type') == 'ping':
+                            await ws.send(json.dumps({"type": "pong", "time": msg.get("time", "")})); continue
+                        try:
+                            ticks = cfg.parser(msg, ts_local)
+                            for t in ticks:
+                                t['venue'] = cfg.name
+                                await trades_queue.put(t)
+                            tick_counts[cfg.name] += len(ticks)
+                        except: pass
+                        if cfg.bbo_parser:
+                            try:
+                                bbo = cfg.bbo_parser(msg, ts_local)
+                                if bbo:
+                                    bbo['venue'] = cfg.name
+                                    await bbo_queue.put(bbo)
+                                    bbo_counts[cfg.name] += 1
+                            except: pass
+                finally:
+                    if ka_task: ka_task.cancel()
+                if connect_time and (time.time() - connect_time) > STABLE_THRESHOLD: attempt = 0
+        except asyncio.CancelledError: return
+        except Exception as e:
+            venue_status[cfg.name], venue_last_error_ts[cfg.name] = 'reconnecting', time.time()
+            venue_errors[cfg.name] = f"{type(e).__name__}"
+            if stop_event.is_set(): return
+            delay = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
+            delay = max(0.5, delay + (delay * 0.25 * (2 * random.random() - 1)))
+            try: await asyncio.wait_for(stop_event.wait(), timeout=delay); return
+            except asyncio.TimeoutError: pass
+            attempt += 1
+
+async def writer_task(queue: asyncio.Queue, stop_event: asyncio.Event,
+                      prefix: str, schema: pa.Schema, label: str):
+    buffer = []; last_rotate = time.time()
+    ROTATION_INTERVAL = 1800 
+
+    def flush_to_file():
+        nonlocal buffer, last_rotate
+        if not buffer: return
+        ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(DATA_DIR, f"{prefix}_{ts_str}.parquet")
+        cols = {n: [r.get(n, 0) for r in buffer] for n in schema.names}
+        pq.write_table(pa.table(cols, schema=schema), path, compression='zstd')
+        print(f"  [WRITER] Saved {prefix}: {len(buffer):,} rows -> {path}")
+        buffer, last_rotate = [], time.time()
+
+    try:
+        while not (stop_event.is_set() and queue.empty()):
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                buffer.append(item)
+            except asyncio.TimeoutError: pass
+            if time.time() - last_rotate >= ROTATION_INTERVAL: flush_to_file()
+    finally: flush_to_file()
+
+async def heartbeat_task(stop_event: asyncio.Event, pbar: tqdm,
+                         start_time: float, collect_seconds: int,
+                         status_output: widgets.Output):
+    while not stop_event.is_set():
+        await asyncio.sleep(0.5); elapsed = time.time() - start_time
+        pbar.n = min(int(elapsed), collect_seconds)
+        total_ticks, total_bbo = sum(tick_counts.values()), sum(bbo_counts.values())
+        active, total_reconn = sum(1 for s in venue_status.values() if s == 'ok'), sum(venue_reconnects.values())
+        pbar.set_postfix_str(f"ticks={total_ticks:,} | bbo={total_bbo:,} | V:{active}/{len(VENUES)}")
+        pbar.refresh()
+        with status_output:
+            clear_output(wait=True)
+            print(f"{'═'*85}\n📊 СТАТУС (Ротация 30м) | Прошло: {elapsed/60:.1f} мин")
+            print(f"{'Venue':<20} {'Ticks':>9} {'Rate/s':>8} {'BBO':>9} {'Status':<14}\n" + "─" * 85)
+            for name in VENUES:
+                tc, bc, st = tick_counts.get(name,0), bbo_counts.get(name,0), venue_status.get(name,'?')
+                m = "✅" if (st=='ok' and tc>0) else "🔄" if st=='ok' else "🔁" if st=='reconnecting' else "⏳"
+                print(f"{m} {name:<18} {tc:>9,} {tc/elapsed if elapsed > 0 else 0:>8.1f} {bc:>9,} {st:<14}")
+            print("═" * 85)
+
+async def run_collector(collect_seconds: int, venues_filter: list[str] = None):
+    global tick_counts, bbo_counts, venue_errors, venue_status, venue_reconnects, venue_last_error_ts
+    tick_counts, bbo_counts, venue_errors, venue_status, venue_reconnects, venue_last_error_ts = {}, {}, {}, {}, {}, {}
+    active_venues = {n: c for n, c in VENUES.items() if venues_filter is None or n in venues_filter}
+    if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+    trades_queue, bbo_queue, stop_event = asyncio.Queue(maxsize=1000000), asyncio.Queue(maxsize=1000000), asyncio.Event()
+    pbar = tqdm(total=collect_seconds, unit="s", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}, {postfix}]")
+    status_output = widgets.Output(); display(status_output); start_time = time.time()
+    ws_tasks = [asyncio.create_task(ws_venue_task(cfg, trades_queue, bbo_queue, stop_event)) for cfg in active_venues.values()]
+    t_writer = asyncio.create_task(writer_task(trades_queue, stop_event, "ticks", TICK_SCHEMA, "ticks"))
+    b_writer = asyncio.create_task(writer_task(bbo_queue, stop_event, "bbo", BBO_SCHEMA, "bbo"))
+    hb = asyncio.create_task(heartbeat_task(stop_event, pbar, start_time, collect_seconds, status_output))
+    try: await asyncio.sleep(collect_seconds)
+    finally:
+        stop_event.set(); await asyncio.sleep(1)
+        for t in ws_tasks: t.cancel()
+        await asyncio.gather(t_writer, b_writer, return_exceptions=True); hb.cancel(); pbar.close()
+    return os.path.join(DATA_DIR, "ticks_*.parquet"), os.path.join(DATA_DIR, "bbo_*.parquet")
+
+print("✅ Движок исправлен: Строгая ротация ровно в 30 минут без промежуточных файлов.")
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+✅ Движок исправлен: Строгая ротация ровно в 30 минут без промежуточных файлов.
+
+STREAM OUTPUT (stdout):
+✅ Движок исправлен: Строгая ротация ровно в 30 минут без промежуточных файлов.
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #5
+==================================================
+
+# ══════════════════════════════════════════════════════════
+# Ячейка 7: БОЕВОЙ СБОР — все 12 бирж
+# ══════════════════════════════════════════════════════════
+# 
+# Рекомендовано: 14400s (4 часа) для ~400-600 событий
+# Минимум:       3600s (1 час) для ~100-150 событий
+# 
+# ⚠️ Не прерывай ячейку — данные пишутся в parquet инкрементально,
+#    но корректное завершение гарантирует закрытие файлов.
+
+COLLECT_SECONDS = 14400*3  # ← поменяй если нужно другое время
+
+print(f"⏱️  Время сбора: {COLLECT_SECONDS}s ({COLLECT_SECONDS/3600:.1f} часов)")
+print(f"📊 Ожидаемое кол-во событий: ~{COLLECT_SECONDS/3600 * 100:.0f}-{COLLECT_SECONDS/3600 * 150:.0f}")
+print(f"📊 Ожидаемый объём тиков: ~{COLLECT_SECONDS * 60 / 1000:.0f}K")
+print()
+
+TICKS_PATH_MAIN, BBO_PATH_MAIN = await run_collector(
+    collect_seconds=COLLECT_SECONDS,
+    venues_filter=None
+)
+
+# ── Сохраняем пути для Notebook 2 ──
+print(f"\n{'═'*65}")
+print(f"📁 Для анализа используй:")
+print(f'   TICKS_PATH = "{TICKS_PATH_MAIN}"')
+print(f'   BBO_PATH   = "{BBO_PATH_MAIN}"')
+
+------------------------------ OUTPUTS ------------------------------
+
+--- Output #1 ---
+TEXT OUTPUT:
+⏱️  Время сбора: 43200s (12.0 часов)
+📊 Ожидаемое кол-во событий: ~1200-1800
+📊 Ожидаемый объём тиков: ~2592K
+
+
+STREAM OUTPUT (stdout):
+⏱️  Время сбора: 43200s (12.0 часов)
+📊 Ожидаемое кол-во событий: ~1200-1800
+📊 Ожидаемый объём тиков: ~2592K
+
+
+
+--- Output #2 ---
+
+TEXT/PLAIN OUTPUT:
+  0%|          | 0/43200s [00:00, ]
+
+[ПРОПУЩЕНО: application/vnd.jupyter.widget-view+json]
+
+--- Output #3 ---
+
+TEXT/PLAIN OUTPUT:
+Output()
+
+[ПРОПУЩЕНО: application/vnd.jupyter.widget-view+json]
+
+--- Output #4 ---
+TEXT OUTPUT:
+  Lighter: REST failed (https://mainnet.zklighter.elliot.ai/api/v1/markets: HTTP Error 403: Forbidden)
+  Lighter: REST failed (https://zklighter.elliot.ai/api/v1/markets: <urlopen error [Errno 8] nodename nor servname provided, or not known>)
+  Lighter: все REST-эндпоинты недоступны, fallback market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 358,246 rows -> data/bbo_20260411_171417.parquet
+  [WRITER] Saved ticks: 122,775 rows -> data/ticks_20260411_171417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 209,709 rows -> data/bbo_20260411_174417.parquet
+  [WRITER] Saved ticks: 92,162 rows -> data/ticks_20260411_174417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 155,202 rows -> data/bbo_20260411_181417.parquet
+  [WRITER] Saved ticks: 57,540 rows -> data/ticks_20260411_181417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 317,694 rows -> data/bbo_20260411_184417.parquet
+  [WRITER] Saved ticks: 253,315 rows -> data/ticks_20260411_184418.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 409,042 rows -> data/bbo_20260411_191417.parquet
+  [WRITER] Saved ticks: 192,633 rows -> data/ticks_20260411_191418.parquet
+  [WRITER] Saved bbo: 390,506 rows -> data/bbo_20260411_194418.parquet
+  [WRITER] Saved ticks: 170,236 rows -> data/ticks_20260411_194418.parquet
+  [WRITER] Saved bbo: 286,514 rows -> data/bbo_20260411_201418.parquet
+  [WRITER] Saved ticks: 104,955 rows -> data/ticks_20260411_201419.parquet
+  [WRITER] Saved bbo: 320,605 rows -> data/bbo_20260411_204419.parquet
+  [WRITER] Saved ticks: 152,122 rows -> data/ticks_20260411_204419.parquet
+  [WRITER] Saved bbo: 247,770 rows -> data/bbo_20260411_211419.parquet
+  [WRITER] Saved ticks: 106,053 rows -> data/ticks_20260411_211419.parquet
+  [WRITER] Saved bbo: 198,667 rows -> data/bbo_20260411_214419.parquet
+  [WRITER] Saved ticks: 72,797 rows -> data/ticks_20260411_214419.parquet
+  [WRITER] Saved bbo: 245,286 rows -> data/bbo_20260411_221419.parquet
+  [WRITER] Saved ticks: 103,957 rows -> data/ticks_20260411_221419.parquet
+  [WRITER] Saved bbo: 256,218 rows -> data/bbo_20260411_224419.parquet
+  [WRITER] Saved ticks: 111,866 rows -> data/ticks_20260411_224419.parquet
+  [WRITER] Saved bbo: 302,353 rows -> data/bbo_20260411_231420.parquet
+  [WRITER] Saved ticks: 158,891 rows -> data/ticks_20260411_231420.parquet
+  [WRITER] Saved bbo: 255,579 rows -> data/bbo_20260411_234420.parquet
+  [WRITER] Saved ticks: 107,960 rows -> data/ticks_20260411_234420.parquet
+  [WRITER] Saved bbo: 255,780 rows -> data/bbo_20260412_001420.parquet
+  [WRITER] Saved ticks: 112,039 rows -> data/ticks_20260412_001420.parquet
+  [WRITER] Saved bbo: 244,918 rows -> data/bbo_20260412_004420.parquet
+  [WRITER] Saved ticks: 98,422 rows -> data/ticks_20260412_004420.parquet
+  [WRITER] Saved bbo: 238,668 rows -> data/bbo_20260412_011420.parquet
+  [WRITER] Saved ticks: 86,073 rows -> data/ticks_20260412_011421.parquet
+  [WRITER] Saved bbo: 512,269 rows -> data/bbo_20260412_014421.parquet
+  [WRITER] Saved ticks: 521,696 rows -> data/ticks_20260412_014421.parquet
+  [WRITER] Saved bbo: 816,069 rows -> data/bbo_20260412_021421.parquet
+  [WRITER] Saved ticks: 605,711 rows -> data/ticks_20260412_021422.parquet
+  [WRITER] Saved bbo: 469,407 rows -> data/bbo_20260412_024422.parquet
+  [WRITER] Saved ticks: 219,036 rows -> data/ticks_20260412_024422.parquet
+  [WRITER] Saved bbo: 352,105 rows -> data/bbo_20260412_031422.parquet
+  [WRITER] Saved ticks: 135,354 rows -> data/ticks_20260412_031422.parquet
+  [WRITER] Saved bbo: 316,785 rows -> data/bbo_20260412_034422.parquet
+  [WRITER] Saved ticks: 130,626 rows -> data/ticks_20260412_034423.parquet
+  [WRITER] Saved bbo: 261,489 rows -> data/bbo_20260412_041422.parquet
+  [WRITER] Saved ticks: 101,584 rows -> data/ticks_20260412_041423.parquet
+  [WRITER] Saved ticks: 104,582 rows -> data/ticks_20260412_044418.parquet
+  [WRITER] Saved bbo: 265,965 rows -> data/bbo_20260412_044418.parquet
+
+═════════════════════════════════════════════════════════════════
+📁 Для анализа используй:
+   TICKS_PATH = "data/ticks_*.parquet"
+   BBO_PATH   = "data/bbo_*.parquet"
+
+STREAM OUTPUT (stdout):
+  Lighter: REST failed (https://mainnet.zklighter.elliot.ai/api/v1/markets: HTTP Error 403: Forbidden)
+  Lighter: REST failed (https://zklighter.elliot.ai/api/v1/markets: <urlopen error [Errno 8] nodename nor servname provided, or not known>)
+  Lighter: все REST-эндпоинты недоступны, fallback market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 358,246 rows -> data/bbo_20260411_171417.parquet
+  [WRITER] Saved ticks: 122,775 rows -> data/ticks_20260411_171417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 209,709 rows -> data/bbo_20260411_174417.parquet
+  [WRITER] Saved ticks: 92,162 rows -> data/ticks_20260411_174417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 155,202 rows -> data/bbo_20260411_181417.parquet
+  [WRITER] Saved ticks: 57,540 rows -> data/ticks_20260411_181417.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 317,694 rows -> data/bbo_20260411_184417.parquet
+  [WRITER] Saved ticks: 253,315 rows -> data/ticks_20260411_184418.parquet
+  Lighter: используем кэшированный market_id = 1
+  Lighter: используем кэшированный market_id = 1
+  [WRITER] Saved bbo: 409,042 rows -> data/bbo_20260411_191417.parquet
+  [WRITER] Saved ticks: 192,633 rows -> data/ticks_20260411_191418.parquet
+  [WRITER] Saved bbo: 390,506 rows -> data/bbo_20260411_194418.parquet
+  [WRITER] Saved ticks: 170,236 rows -> data/ticks_20260411_194418.parquet
+  [WRITER] Saved bbo: 286,514 rows -> data/bbo_20260411_201418.parquet
+  [WRITER] Saved ticks: 104,955 rows -> data/ticks_20260411_201419.parquet
+  [WRITER] Saved bbo: 320,605 rows -> data/bbo_20260411_204419.parquet
+  [WRITER] Saved ticks: 152,122 rows -> data/ticks_20260411_204419.parquet
+  [WRITER] Saved bbo: 247,770 rows -> data/bbo_20260411_211419.parquet
+  [WRITER] Saved ticks: 106,053 rows -> data/ticks_20260411_211419.parquet
+  [WRITER] Saved bbo: 198,667 rows -> data/bbo_20260411_214419.parquet
+  [WRITER] Saved ticks: 72,797 rows -> data/ticks_20260411_214419.parquet
+  [WRITER] Saved bbo: 245,286 rows -> data/bbo_20260411_221419.parquet
+  [WRITER] Saved ticks: 103,957 rows -> data/ticks_20260411_221419.parquet
+  [WRITER] Saved bbo: 256,218 rows -> data/bbo_20260411_224419.parquet
+  [WRITER] Saved ticks: 111,866 rows -> data/ticks_20260411_224419.parquet
+  [WRITER] Saved bbo: 302,353 rows -> data/bbo_20260411_231420.parquet
+  [WRITER] Saved ticks: 158,891 rows -> data/ticks_20260411_231420.parquet
+  [WRITER] Saved bbo: 255,579 rows -> data/bbo_20260411_234420.parquet
+  [WRITER] Saved ticks: 107,960 rows -> data/ticks_20260411_234420.parquet
+  [WRITER] Saved bbo: 255,780 rows -> data/bbo_20260412_001420.parquet
+  [WRITER] Saved ticks: 112,039 rows -> data/ticks_20260412_001420.parquet
+  [WRITER] Saved bbo: 244,918 rows -> data/bbo_20260412_004420.parquet
+  [WRITER] Saved ticks: 98,422 rows -> data/ticks_20260412_004420.parquet
+  [WRITER] Saved bbo: 238,668 rows -> data/bbo_20260412_011420.parquet
+  [WRITER] Saved ticks: 86,073 rows -> data/ticks_20260412_011421.parquet
+  [WRITER] Saved bbo: 512,269 rows -> data/bbo_20260412_014421.parquet
+  [WRITER] Saved ticks: 521,696 rows -> data/ticks_20260412_014421.parquet
+  [WRITER] Saved bbo: 816,069 rows -> data/bbo_20260412_021421.parquet
+  [WRITER] Saved ticks: 605,711 rows -> data/ticks_20260412_021422.parquet
+  [WRITER] Saved bbo: 469,407 rows -> data/bbo_20260412_024422.parquet
+  [WRITER] Saved ticks: 219,036 rows -> data/ticks_20260412_024422.parquet
+  [WRITER] Saved bbo: 352,105 rows -> data/bbo_20260412_031422.parquet
+  [WRITER] Saved ticks: 135,354 rows -> data/ticks_20260412_031422.parquet
+  [WRITER] Saved bbo: 316,785 rows -> data/bbo_20260412_034422.parquet
+  [WRITER] Saved ticks: 130,626 rows -> data/ticks_20260412_034423.parquet
+  [WRITER] Saved bbo: 261,489 rows -> data/bbo_20260412_041422.parquet
+  [WRITER] Saved ticks: 101,584 rows -> data/ticks_20260412_041423.parquet
+  [WRITER] Saved ticks: 104,582 rows -> data/ticks_20260412_044418.parquet
+  [WRITER] Saved bbo: 265,965 rows -> data/bbo_20260412_044418.parquet
+
+═════════════════════════════════════════════════════════════════
+📁 Для анализа используй:
+   TICKS_PATH = "data/ticks_*.parquet"
+   BBO_PATH   = "data/bbo_*.parquet"
+
+--------------------------------------------------------------------
+
+==================================================
+Code Block #6
+==================================================
+
+

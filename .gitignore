@@ -1,0 +1,16 @@
+# Данные (самое тяжелое)
+data/
+*.parquet
+*.pkl
+*.db
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Система
+.DS_Store
+.vscode/
